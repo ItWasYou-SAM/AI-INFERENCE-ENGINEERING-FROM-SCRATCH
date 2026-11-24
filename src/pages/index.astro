@@ -1,0 +1,247 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import GPUHero from '../components/three/GPUHero.tsx';
+import StatsStrip from '../components/home/StatsStrip.tsx';
+import SpeedOfLight from '../components/home/SpeedOfLight.tsx';
+import MythCards from '../components/home/MythCards.tsx';
+import LevelCards from '../components/home/LevelCards.tsx';
+import ScrollProgress from '../components/home/ScrollProgress.tsx';
+import { levels, allChapters, allModules } from '../data/roadmap';
+import { sources } from '../data/sources';
+
+const steps = [
+  { t: 'Concept', d: 'First principles in plain language, with the maths written out.', g: '✎' },
+  { t: 'Animation', d: 'Simulators you can break: sliders, drags, step-throughs.', g: '◐' },
+  { t: 'Code lab', d: 'NumPy on a CPU first, then CUDA, Triton or vLLM where marked.', g: '⌘' },
+  { t: 'Sources', d: 'The repo, paper or book section each idea comes from.', g: '§' },
+  { t: 'Quiz', d: 'Sharp questions, each with an explanation.', g: '?' },
+];
+
+const firstOf = (n: number) => {
+  const m = levels[n - 1].modules[0];
+  return `/learn/${m.id}/${m.chapters[0].slug}`;
+};
+const levelCards = levels.map((l) => ({
+  num: l.num,
+  name: l.name,
+  question: l.question,
+  href: firstOf(l.num),
+  chapters: l.modules.reduce((n, m) => n + m.chapters.length, 0),
+  modules: l.modules.map((m) => ({ label: m.id === 'capstone' ? 'C' : `M${m.num}`, title: m.title })),
+}));
+
+const concepts = [
+  'Roofline',
+  'Arithmetic intensity',
+  'Warps & SIMT',
+  'Memory coalescing',
+  'Tiled GEMM',
+  'FlashAttention',
+  'KV cache',
+  'PagedAttention',
+  'Continuous batching',
+  'Chunked prefill',
+  'RadixAttention',
+  'Speculative decoding',
+  'FP8 · INT4',
+  'Tensor parallelism',
+  'Prefill/decode disaggregation',
+  'KV-aware routing',
+  'SLO goodput',
+  'Cost per million tokens',
+];
+---
+
+<BaseLayout title="Home">
+  <ScrollProgress client:load />
+
+  <!-- ─── Hero ─────────────────────────────────────────── -->
+  <div class="relative overflow-hidden">
+    <div aria-hidden="true">
+      <span class="blob top-[-10rem] right-[-6rem] h-[34rem] w-[34rem]" style="background:var(--blue)"></span>
+    </div>
+
+    <section class="relative mx-auto grid max-w-6xl items-center gap-6 px-5 pt-10 pb-6 lg:grid-cols-[1fr_1.1fr] lg:pt-16">
+      <div class="relative z-10">
+        <p class="rise inline-flex items-center gap-2 rounded-full border border-rule bg-paper/60 px-3 py-1 font-mono text-[0.68rem] tracking-wide text-ink-soft uppercase backdrop-blur">
+          <span class="relative flex h-2 w-2">
+            <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue opacity-50"></span>
+            <span class="relative inline-flex h-2 w-2 rounded-full bg-blue"></span>
+          </span>
+          A field guide in {allChapters.length} chapters
+        </p>
+        <h1 class="rise mt-4 text-5xl leading-[1.04] sm:text-6xl lg:text-7xl" style="animation-delay:80ms">
+          Inference engineering,<br /><span class="grad-text pr-2 italic">from scratch.</span>
+        </h1>
+        <p class="rise mt-6 max-w-xl text-lg leading-relaxed text-ink-soft" style="animation-delay:160ms">
+          Learn why GPUs look the way they do, write the kernels an LLM runs, and understand the KV cache down to the byte. Then build a
+          serving engine and run it at scale. Each idea gets an explanation, an animation and runnable code.
+        </p>
+        <div class="rise mt-8 flex flex-wrap gap-3" style="animation-delay:240ms">
+          <a href="/roadmap" class="grad-btn rounded-full px-6 py-3 font-mono text-xs tracking-wide uppercase hover:-translate-y-0.5">See the roadmap →</a>
+          <a
+            href="/learn/m00/what-is-inference-engineering"
+            class="rounded-full border border-dashed border-ink bg-paper/50 px-6 py-3 font-mono text-xs tracking-wide uppercase backdrop-blur transition hover:-translate-y-0.5"
+          >
+            Start chapter 0.1
+          </a>
+        </div>
+        <dl class="rise mt-10 flex gap-8" style="animation-delay:320ms">
+          {
+            [
+              [levels.length, 'levels'],
+              [allModules.length, 'modules'],
+              [allChapters.length, 'chapters'],
+              [Object.keys(sources).length, 'sources'],
+            ].map(([n, l]) => (
+              <div>
+                <dt class="sr-only">{l}</dt>
+                <dd class="font-display text-3xl">{n}</dd>
+                <dd class="eyebrow">{l}</dd>
+              </div>
+            ))
+          }
+        </dl>
+      </div>
+
+      <div class="relative -mx-5 h-[24rem] sm:h-[28rem] lg:mx-0 lg:h-[31rem]">
+        <svg id="hero-sketch" viewBox="0 0 400 260" class="absolute inset-0 m-auto h-3/4 w-3/4 text-ink-faint transition-opacity duration-700" aria-hidden="true">
+          <rect x="40" y="40" width="320" height="180" rx="8" fill="none" stroke="currentColor" stroke-dasharray="4 5"></rect>
+          {Array.from({ length: 48 }, (_, i) => <rect x={110 + (i % 8) * 23} y={70 + Math.floor(i / 8) * 21} width="17" height="15" fill="none" stroke="currentColor" />)}
+          {[0, 1].map((s) => [0, 1].map((r) => <rect x={s ? 312 : 52} y={78 + r * 64} width="36" height="48" fill="none" stroke="currentColor" />))}
+        </svg>
+        <div class="absolute inset-0">
+          <GPUHero client:only="react" />
+        </div>
+        <p class="absolute top-0 left-2 font-mono text-[0.65rem] text-ink-faint italic">fig. 0: what a GPU does to write one word</p>
+      </div>
+    </section>
+
+    <!-- concept marquee -->
+    <div class="marquee relative mt-6 border-y border-dashed border-rule py-3" aria-label="Concepts covered">
+      <div class="marquee-track">
+        {
+          [0, 1].map((copy) => (
+            <ul class="flex shrink-0 items-center" aria-hidden={copy === 1 ? 'true' : undefined}>
+              {concepts.map((c) => (
+                <li class="flex items-center font-display text-base whitespace-nowrap text-ink-soft">
+                  <span class="px-5">{c}</span>
+                  <span class="text-xs text-ink-faint">✦</span>
+                </li>
+              ))}
+            </ul>
+          ))
+        }
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Levels ───────────────────────────────────────── -->
+  <section class="mx-auto mt-20 max-w-6xl px-5">
+    <div class="reveal mb-8 flex items-end justify-between gap-6">
+      <div>
+        <p class="eyebrow">Where to start</p>
+        <h2 class="mt-2 text-3xl sm:text-4xl">Four levels, one path</h2>
+        <p class="mt-2 max-w-xl text-ink-soft">New to all of this? Start at level 1. Already know some of it? Pick the level whose question you can't answer yet.</p>
+      </div>
+      <a href="/roadmap" class="ink-link hidden font-mono text-xs tracking-wide uppercase sm:inline">Full roadmap →</a>
+    </div>
+    <LevelCards client:visible levels={levelCards} />
+  </section>
+
+  <!-- ─── Speed of light ───────────────────────────────── -->
+  <section class="mx-auto mt-24 max-w-6xl px-5">
+    <div class="reveal mb-8 grid gap-4 lg:grid-cols-[1fr_1fr] lg:items-end">
+      <div>
+        <p class="eyebrow">Try it</p>
+        <h2 class="mt-2 text-3xl sm:text-4xl">How fast can a GPU <span class="italic text-blue">possibly</span> talk?</h2>
+      </div>
+      <p class="text-ink-soft">
+        To write each token, the GPU has to read <b class="text-ink">every weight</b> of the model from memory. Pick a model and a GPU to see
+        the theoretical limit, then add users and watch the bottleneck move.
+      </p>
+    </div>
+    <div class="reveal" style="--d:100ms">
+      <SpeedOfLight client:visible />
+    </div>
+  </section>
+
+  <!-- ─── Numbers that matter ──────────────────────────── -->
+  <section class="mx-auto mt-20 max-w-6xl px-5">
+    <div class="reveal mb-8 max-w-2xl">
+      <p class="eyebrow">Four numbers to know</p>
+      <h2 class="mt-2 text-3xl sm:text-4xl">The facts the rest of the course explains</h2>
+    </div>
+    <StatsStrip client:visible />
+  </section>
+
+  <!-- ─── Myths ────────────────────────────────────────── -->
+  <section class="mx-auto mt-24 max-w-6xl px-5">
+    <div class="reveal mb-8 max-w-2xl">
+      <p class="eyebrow">Myth vs fact</p>
+      <h2 class="mt-2 text-3xl sm:text-4xl">Six things most people get wrong about LLM speed</h2>
+      <p class="mt-3 text-ink-soft">Tap a card to flip it. Each fact links to the chapter that proves it.</p>
+    </div>
+    <MythCards client:visible />
+  </section>
+
+  <!-- ─── Chapter anatomy ──────────────────────────────── -->
+  <section class="mx-auto mt-24 max-w-6xl px-5">
+    <div class="reveal mb-8">
+      <p class="eyebrow">How you learn</p>
+      <h2 class="mt-2 text-3xl sm:text-4xl">The anatomy of a chapter</h2>
+    </div>
+    <ol class="relative grid gap-4 md:grid-cols-5">
+      <span class="absolute top-[2.3rem] right-[10%] left-[10%] hidden border-t border-dashed border-rule md:block" aria-hidden="true"></span>
+      {
+        steps.map((s, i) => (
+          <li class="reveal relative" style={`--d:${i * 110}ms`}>
+            <div class="sheet group h-full p-4 transition duration-300 hover:-translate-y-1">
+              <span class="relative grid h-10 w-10 place-items-center rounded-full border border-ink bg-paper font-display text-lg transition-colors duration-300 group-hover:border-blue group-hover:text-blue">
+                {s.g}
+              </span>
+              <p class="mt-3 font-display text-lg">
+                <span class="mr-1 font-mono text-xs text-ink-faint">0{i + 1}</span>
+                {s.t}
+              </p>
+              <p class="mt-1 text-sm text-ink-soft">{s.d}</p>
+            </div>
+          </li>
+        ))
+      }
+    </ol>
+  </section>
+
+  <!-- ─── Sources + CTA ────────────────────────────────── -->
+  <section class="mx-auto mt-24 max-w-6xl px-5">
+    <div class="reveal relative overflow-hidden rounded-2xl bg-ink p-8 text-paper sm:p-12">
+      <div class="relative grid gap-8 lg:grid-cols-[1.2fr_1fr] lg:items-center">
+        <div>
+          <p class="font-mono text-[0.7rem] tracking-[0.14em] uppercase opacity-80">Built from open repos, papers and books</p>
+          <h2 class="mt-2 text-3xl sm:text-4xl">Start with one question: why is the GPU idle?</h2>
+          <p class="mt-3 max-w-lg opacity-90">
+            The answer leads through memory bandwidth, KV caches, batching and routing. That's the whole course.
+          </p>
+          <div class="mt-6 flex flex-wrap gap-3">
+            <a href="/learn/m00/what-is-inference-engineering" class="rounded-full bg-paper px-6 py-3 font-mono text-xs tracking-wide text-ink uppercase transition hover:-translate-y-0.5">
+              Begin at 0.1 →
+            </a>
+            <a href="/sources" class="rounded-full border border-paper/60 px-6 py-3 font-mono text-xs tracking-wide uppercase transition hover:-translate-y-0.5 hover:bg-paper/10">
+              The sources
+            </a>
+          </div>
+        </div>
+        <ul class="grid grid-cols-2 gap-2">
+          {
+            Object.values(sources).map((s) => (
+              <li class="rounded-lg border border-paper/15 px-3 py-2">
+                <span class="block font-mono text-[0.6rem] tracking-wide uppercase opacity-60">{s.kind}</span>
+                <span class="block font-display text-[0.95rem] leading-snug">{s.title}</span>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

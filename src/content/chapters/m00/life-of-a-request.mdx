@@ -1,0 +1,183 @@
+---
+summary: Follow a single prompt from the moment you press Enter to the last streamed word, through tokenization, scheduling, prefill, decode and streaming. Each stage is a place where latency hides.
+duration: 20 min
+objectives:
+  - Name the six stages a request passes through in an inference server
+  - Explain what prefill and decode each do, and why they behave so differently
+  - Decompose end-to-end latency into TTFT and TPOT
+  - Measure TTFT and TPOT of a real server yourself
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import RequestLifecycle from '../../../components/viz/RequestLifecycle.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+You type *"Explain the KV cache in one sentence."* and press Enter. About a fifth of a second later words start appearing, and they keep
+streaming until the answer is done. Here is everything that happened in between.
+
+<Figure label="fig. 0.2" caption="One request, start to finish. Press Play, or Step through each stage and each decoded token. Watch the KV cache fill in during prefill and then grow by one slot per decode step.">
+  <RequestLifecycle client:visible />
+</Figure>
+
+## 1. The request arrives
+
+Almost every inference server speaks the **OpenAI-compatible API**. A chat request is plain JSON:
+
+```json title="POST /v1/chat/completions"
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "messages": [{ "role": "user", "content": "Explain the KV cache in one sentence." }],
+  "max_tokens": 64,
+  "temperature": 0,
+  "stream": true
+}
+```
+
+The API server validates it and applies the model's **chat template**, which wraps the messages in the special tokens the model was
+trained with. It then hands the request to the engine.
+
+## 2. Tokenize
+
+Models don't read characters. They read **token IDs**, integers that index into a vocabulary of roughly 32K to 200K entries. A
+tokenizer (usually BPE) splits text into sub-word pieces:
+
+```text
+"Explain the KV cache"  →  ["Explain", " the", " KV", " cache"]  →  [ ... four integers ... ]
+```
+
+The rule of thumb for English is **about 0.75 words per token**. Tokenization runs on the CPU and is cheap, but every cost in this
+curriculum is counted in *tokens*, so it pays to know your prompt's real length.
+
+## 3. Wait in the scheduler
+
+The engine runs a **scheduler loop**. On every step it decides which requests run. A new request is admitted only if there is room in
+the batch **and enough free KV-cache memory** to hold its prompt. When the server is busy, requests wait in a queue.
+
+<Callout type="warning" title="The hidden latency">
+  On a loaded server, **queueing time often dominates TTFT**. A benchmark that sends one request at a time never sees it, and that is
+  why [Module 13](/learn/m13/serving-metrics) load-tests at realistic concurrency.
+</Callout>
+
+## 4. Prefill: read the whole prompt at once
+
+All prompt tokens go through the model in **one forward pass**, in parallel. At every layer, the keys and values of every prompt token
+are written into the **KV cache** ([1.5](/learn/m01/why-kv-cache) explains why). The logits at the *last* position are sampled to
+produce the **first output token**.
+
+Prefill does many FLOPs per byte loaded: one weight read is reused across all N prompt tokens. So it is **compute-bound**, and its
+time grows roughly linearly with prompt length (quadratically for attention on very long prompts).
+
+## 5. Decode: one token per step
+
+Now the loop begins. Each **decode step**:
+
+1. Feeds in only the **newest** token.
+2. Computes that token's Q, K, V at every layer, and **appends** the new K and V to the cache.
+3. Attends over **all** cached keys and values, the prompt plus everything generated so far.
+4. Samples the next token from the logits ([1.4](/learn/m01/autoregressive-generation)).
+
+Each step reads every weight and the whole KV cache to produce **a single token**. That makes decode **memory-bound**, as you saw in
+[0.1](/learn/m00/what-is-inference-engineering). A step takes about the same time whether the prompt was 10 tokens or 1,000, though a
+growing KV cache slowly adds to it.
+
+## 6. Stream and finish
+
+Every new token ID is **detokenized** back into text and sent immediately as a **server-sent event** (`data: {...}` lines over HTTP).
+That is why you see words appear one by one. When the model emits its end-of-sequence token, or hits `max_tokens`, the request
+finishes and its **KV-cache memory is freed** for the next request in the queue.
+
+## Putting numbers on it
+
+The latency a user feels splits into two parts:
+
+$$
+\text{end-to-end latency} \;=\; \underbrace{\text{TTFT}}_{\text{queue + prefill}} \;+\; (n_{\text{out}} - 1) \times \underbrace{\text{TPOT}}_{\text{one decode step}}
+$$
+
+| | Set by | Grows with | Bound by |
+|---|---|---|---|
+| **TTFT** | queue + prefill | prompt length, server load | compute (prefill), scheduling |
+| **TPOT** | decode step time | batch size, context length | memory bandwidth |
+
+<Callout type="insight">
+  Prefill and decode are two different workloads sharing one GPU: one is compute-bound and runs once, the other is memory-bound and
+  repeats hundreds of times. Much of modern serving, such as [chunked prefill](/learn/m10/chunked-prefill) and
+  [prefill/decode disaggregation](/learn/m15/why-disaggregate), is about stopping them from getting in each other's way.
+</Callout>
+
+## Lab: time a real request 🟡
+
+`measure_ttft.py` streams one request from **any** OpenAI-compatible server and reports TTFT and TPOT. It uses only the Python
+standard library. You don't need a GPU: [Ollama](https://ollama.com) or llama.cpp will run a 0.5B model on a laptop CPU.
+
+```python title="labs/m00/0.2/measure_ttft.py (core loop)"
+t0 = time.perf_counter()
+stamps = []
+for piece in stream_chat(base, model, prompt, max_tokens):   # parses "data: {...}" SSE lines
+    stamps.append(time.perf_counter())
+
+ttft = (stamps[0] - t0) * 1000
+gaps = [(b - a) * 1000 for a, b in zip(stamps, stamps[1:])]
+tpot = sum(gaps) / len(gaps)
+```
+
+```bash
+# CPU: Ollama with a tiny model
+ollama pull qwen2.5:0.5b
+python labs/m00/0.2/measure_ttft.py --base http://localhost:11434 --model qwen2.5:0.5b
+
+# GPU: vLLM
+vllm serve Qwen/Qwen2.5-0.5B-Instruct
+python labs/m00/0.2/measure_ttft.py --base http://localhost:8000 --model Qwen/Qwen2.5-0.5B-Instruct
+```
+
+<Callout type="note" title="Exercises">
+  1. Make the prompt 10× longer. Which number moves, TTFT or TPOT, and why?
+  2. Raise `--max-tokens` to 512. Does TPOT drift as the output grows?
+  3. Run two copies at the same time. What happens to each one's TTFT and TPOT?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="MOHITH" note="'The inference pipeline' and 'Two phases of inference': prefill sets TTFT, decode sets TPOT." />
+  <SourceCard id="TTFT" note="Week 2 deploys a model behind exactly this OpenAI-compatible API. Week 3 measures TTFT and inter-token latency on a dashboard." />
+  <SourceCard id="CUDA100" note="Days 72–73: greedy decoding for a small transformer written in CUDA, then the same loop with a KV cache (reported 18.5 ms → 2.5 ms)." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'You double the prompt length but keep max_tokens fixed. What changes most?',
+      options: ['TPOT', 'TTFT', 'Neither', 'Only tokenization time'],
+      answer: 1,
+      explain: 'Prefill processes every prompt token, so TTFT grows. Each decode step still emits one token, so TPOT barely changes (the KV cache is a bit larger).',
+    },
+    {
+      q: 'What does a single decode step add to the KV cache, per layer?',
+      options: [
+        'Nothing; the KV cache is only written in prefill',
+        'K and V for every prompt token again',
+        'K and V for the one new token',
+        'Only the logits',
+      ],
+      answer: 2,
+      explain: 'Decode appends exactly one K and one V per layer per KV head for the token it just processed.',
+    },
+    {
+      q: 'A server has TTFT = 200 ms and TPOT = 25 ms. Roughly how long until a 101-token answer is complete?',
+      options: ['225 ms', '2.5 s', '2.7 s', '20 s'],
+      answer: 2,
+      explain: '200 ms + (101 − 1) × 25 ms = 200 + 2,500 = 2,700 ms.',
+    },
+    {
+      q: 'Your single-request benchmark shows a 90 ms TTFT, but users report about 1.5 s at peak hours. What is the most likely culprit?',
+      options: ['Tokenization', 'Queueing in the scheduler under load', 'Detokenization', 'The JSON parser'],
+      answer: 1,
+      explain: 'Under concurrency, requests wait for batch slots and KV memory. Queue time is part of TTFT, and a one-at-a-time benchmark never sees it.',
+    },
+  ]}
+/>

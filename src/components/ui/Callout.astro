@@ -1,0 +1,26 @@
+---
+interface Props {
+  type?: 'note' | 'insight' | 'warning' | 'try';
+  title?: string;
+}
+const { type = 'note', title } = Astro.props;
+const styles = {
+  note: { color: 'var(--blue)', label: 'Note', glyph: '✎' },
+  insight: { color: 'var(--green)', label: 'Key insight', glyph: '✦' },
+  warning: { color: 'var(--red)', label: 'Careful', glyph: '!' },
+  try: { color: 'var(--amber)', label: 'Try it', glyph: '▶' },
+}[type];
+---
+
+<aside
+  class="relative my-6 rounded-lg border border-dashed py-4 pr-5 pl-12"
+  style={`border-color:color-mix(in srgb, ${styles.color} 50%, transparent);background:color-mix(in srgb, ${styles.color} 6%, transparent)`}
+>
+  <span
+    class="absolute top-4 left-4 grid h-5 w-5 place-items-center rounded-full font-mono text-[0.7rem] font-bold text-paper"
+    style={`background:${styles.color}`}
+    aria-hidden="true">{styles.glyph}</span
+  >
+  <p class="eyebrow mb-1" style={`color:${styles.color}`}>{title ?? styles.label}</p>
+  <div class="text-[0.95rem] leading-relaxed [&>p+p]:mt-2"><slot /></div>
+</aside>

@@ -1,0 +1,158 @@
+---
+summary: Training makes a model once. Inference runs it billions of times. Inference engineering is the craft of making each of those runs fast, cheap and reliable, and this chapter maps the territory.
+duration: 15 min
+objectives:
+  - Say what inference engineering is and how it differs from training
+  - Name the numbers inference engineers are judged on (TTFT, TPOT, throughput, cost)
+  - Place any optimization on the six-layer inference stack
+  - Do a "speed of light" estimate for decoding a 7B model
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import InferenceStack from '../../../components/viz/InferenceStack.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+A trained language model is a file of numbers. **Inference** is running that file to turn a prompt into tokens.
+**Inference engineering** is everything between "the model works in a notebook" and "ten thousand people are using it at once, each
+gets an answer in under a second, and the GPU bill is affordable."
+
+## Training once, inference forever
+
+Training is a single huge job. It runs for weeks, you optimize it once, and then it's over. Inference has a different shape:
+
+| | Training | Inference |
+|---|---|---|
+| How often | Once per model | On every request, forever |
+| Unit of work | A big batch of fixed-length sequences | Many small requests of unpredictable length, arriving at random times |
+| What matters | Total time to finish | Latency **per user** *and* throughput **per GPU** |
+| Bottleneck | Usually compute | Usually **memory bandwidth** (during decode) |
+| Failure mode | The run takes longer | Users wait, requests time out, money burns |
+
+Once a model is popular, the total compute spent serving it can exceed what was spent training it. That is why companies hire people
+whose whole job is making inference efficient.
+
+## The numbers you are judged on
+
+Every decision in this curriculum moves one of these:
+
+- **TTFT** (*time to first token*): how long the user stares at a blank screen. It is set by the **prefill** phase, which
+  processes the whole prompt.
+- **TPOT / ITL** (*time per output token*, *inter-token latency*): how fast text streams once it starts. It is set by the
+  **decode** phase, which produces one token per step.
+- **Throughput**: total tokens per second across all users on a GPU. More throughput means fewer GPUs.
+- **Cost**: dollars per million tokens. Roughly, GPU price per hour divided by throughput.
+- **Goodput**: throughput that *also* meets the latency targets (SLOs). This is what actually counts in production.
+
+<Callout type="insight" title="The trade-off triangle">
+  Quality, latency and throughput pull against each other. A bigger batch raises throughput but makes each user wait a little longer.
+  A smaller quantized model is faster but can lose quality. Inference engineering is mostly the art of moving this triangle's corners
+  outward, so that you give up less of one to get more of another.
+</Callout>
+
+## Why it's hard: one token at a time
+
+LLMs are **autoregressive**: token $t+1$ depends on token $t$, so the output is produced one step at a time. Each decode step runs the
+*entire* model to produce *one* token per sequence.
+
+Here is what that means for Mistral 7B in FP16 on an H100:
+
+$$
+\text{weights} \approx 7.24\times10^{9} \times 2\ \text{B} \approx 14.5\ \text{GB}
+\qquad
+\text{HBM bandwidth} \approx 3.35\ \text{TB/s}
+$$
+
+Every decode step must stream all 14.5 GB of weights from memory into the chip, so even with infinitely fast math:
+
+$$
+t_{\text{step}} \;\ge\; \frac{14.5\ \text{GB}}{3.35\ \text{TB/s}} \;\approx\; 4.3\ \text{ms}
+\quad\Longrightarrow\quad
+\le 230\ \text{tokens/s for a single user}
+$$
+
+That is the **speed of light** for this model on this GPU. Meanwhile the H100's ~989 TFLOP/s of tensor-core compute sits about
+99.7% idle. Almost every trick in this curriculum comes from looking at that gap:
+
+- **Batching**: one weight read serves 64 users instead of 1 (Modules [3](/learn/m03/roofline) and [10](/learn/m10/continuous-batching)).
+- **Quantization**: INT4 weights are 4× fewer bytes to stream ([Module 12](/learn/m12/number-formats)).
+- **Speculative decoding**: verify several guessed tokens per weight read ([Module 11](/learn/m11/speculative-decoding)).
+- **KV-cache engineering**: the *other* thing decode has to read every step ([Module 9](/learn/m09/kv-cache-size)).
+
+<Callout type="note">
+  You will derive this estimate properly in [3.3 The roofline model](/learn/m03/roofline). For now, remember one sentence:
+  **decode is limited by how fast you can move bytes, not by how fast you can multiply.**
+</Callout>
+
+## The inference stack
+
+Inference problems live at different layers, from the silicon up to the business. A good inference engineer can move between them.
+A slow endpoint might be a routing problem, a batching problem, a kernel problem, or simply the wrong GPU.
+
+<Figure label="fig. 0.1" caption="Six layers of inference. Hover or tap a layer to see what lives there, the knobs you turn, and the modules that cover it.">
+  <InferenceStack client:visible />
+</Figure>
+
+This curriculum climbs the stack from the bottom up. You learn the hardware first, because every layer above it is shaped by the same
+two numbers: **FLOP/s** and **bytes/s**.
+
+## What an inference engineer actually does
+
+A realistic week might include:
+
+1. **Measuring**: load-test a new model, find that p99 TTFT spikes past 2 s at 40 requests/s ([Module 13](/learn/m13/serving-metrics)).
+2. **Diagnosing**: notice long prompts block short ones, and enable chunked prefill ([10.3](/learn/m10/chunked-prefill)).
+3. **Optimizing**: switch the KV cache to FP8, fit twice as many sequences, and raise throughput ([9.6](/learn/m09/kv-cache-quantization)).
+4. **Profiling**: find a non-fused layer norm eating 6% of step time, and fuse it ([7.1](/learn/m07/top-down-profiling), [8.1](/learn/m08/norms-fused-residual)).
+5. **Scaling**: put a KV-aware router in front of 8 replicas so repeat conversations hit warm caches ([15.3](/learn/m15/load-balancing-policies)).
+6. **Pricing**: recompute cost per million tokens and decide whether an H100 or two L4s is cheaper for this traffic ([16.1](/learn/m16/cost-per-million-tokens)).
+
+<Callout type="try" title="Before the next chapter">
+  Write down your own guess: when you send a prompt to a chatbot, what happens between pressing Enter and the first word appearing?
+  The next chapter, [0.2 The life of a request](/learn/m00/life-of-a-request), walks through it step by step.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="MOHITH" note="'The problem', 'The trade-off triangle' and 'Two phases of inference': the framing this chapter uses." />
+  <SourceCard id="TTFT" note="The whole 10-week path: what an inference engineer builds, measures and ships." />
+  <SourceCard id="BGE" note="Ch 4–5 and 14: why bandwidth, not compute, is usually the wall." />
+  <SourceCard id="ICP" note="How the scarce resource moves from FLOPs to state, placement and decision quality: the top of the stack." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Which phase mostly determines time to first token (TTFT)?',
+      options: ['Decode', 'Prefill', 'Detokenization', 'Model loading'],
+      answer: 1,
+      explain: 'Prefill processes the whole prompt and produces the first token. Decode then produces the rest, one token per step.',
+    },
+    {
+      q: 'A 14 GB model is decoded for one user on a GPU with 2 TB/s of memory bandwidth. What is the best possible step time?',
+      options: ['0.7 ms', '7 ms', '70 ms', 'It depends only on TFLOP/s'],
+      answer: 1,
+      explain: '14 GB ÷ 2 TB/s = 7 ms per token, about 140 tokens/s, because every step streams all the weights.',
+    },
+    {
+      q: 'Why does batching many users together raise throughput during decode?',
+      options: [
+        'It reduces the number of layers',
+        'One read of the weights produces a token for every sequence in the batch',
+        'It makes tokenization faster',
+        'It lowers the model’s FLOPs per token',
+      ],
+      answer: 1,
+      explain: 'Decode is limited by bytes moved. Sharing one weight read across B sequences gives roughly B× the tokens for about the same time.',
+    },
+    {
+      q: 'At peak load your server produces lots of tokens per second, but only 60% of requests meet both their TTFT and TPOT targets. Which metric captures this?',
+      options: ['Throughput', 'Goodput', 'FLOP utilization', 'Perplexity'],
+      answer: 1,
+      explain: 'Goodput counts only work that meets the SLOs. High raw throughput with many SLO misses is low goodput.',
+    },
+  ]}
+/>

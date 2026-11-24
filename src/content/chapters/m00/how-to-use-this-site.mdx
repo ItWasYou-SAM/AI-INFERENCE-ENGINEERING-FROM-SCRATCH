@@ -1,0 +1,149 @@
+---
+summary: How the chapters are built, what the lab badges mean, how to set up your machine, and how to pick a path through 109 chapters without getting lost.
+duration: 15 min
+objectives:
+  - Know what each part of a chapter is for, and how to use it
+  - Set up a Python environment and check what your machine can run
+  - Choose a path through the curriculum that fits your background
+---
+import Callout from '../../../components/ui/Callout.astro';
+import LabBadge from '../../../components/ui/LabBadge.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+This site is a field guide, not a textbook. It's meant to be read with a terminal open next to it.
+
+## The anatomy of every chapter
+
+1. **Concept**: the idea from first principles, with the arithmetic written out. If a number appears, you should be able to
+   reproduce it with a pencil.
+2. **Animation**: an interactive figure (marked ✦). Don't just watch it: **break it**. Drag sliders to extremes and find where it
+   runs out of memory, goes memory-bound, or stops paying off.
+3. **Code lab**: a short script in `labs/<module>/<chapter>/` with exercises. Run it, then change it.
+4. **Sources**: the repo, paper, blog or book section the idea comes from. Go there for depth.
+5. **Quiz**: four questions, each with an explanation. If you miss one, reread the section it points to.
+
+Press **Mark chapter complete** at the end of a chapter. Your progress is stored in this browser and shows up on the
+[roadmap](/roadmap) and in the sidebar.
+
+## What the lab badges mean
+
+| Badge | Meaning | Where to run it |
+|---|---|---|
+| <LabBadge lab="cpu" /> | Pure Python/NumPy or in-browser | Any laptop |
+| <LabBadge lab="gpu-optional" /> | Works on CPU, faster or more realistic on a GPU | Laptop, or a GPU if you have one |
+| <LabBadge lab="gpu-required" /> | CUDA, Triton, Nsight or vLLM: needs an NVIDIA GPU | Your GPU, Colab/Kaggle, or a rented one |
+
+<Callout type="insight" title="Concepts first, GPUs second">
+  Every 🔴 chapter still has a full concept section and an animation you can learn from without a GPU. The GPU only matters when you
+  want to *measure* things. You can get through Level 1 entirely on a laptop.
+</Callout>
+
+## Set up your machine
+
+```bash
+git clone <this repo> && cd AI-INFERENCE-ENGINEERING-FROM-SCRATCH
+python -m venv .venv && source .venv/bin/activate
+pip install -r labs/requirements.txt
+python labs/m00/0.3/check_env.py
+```
+
+`check_env.py` looks for Python, NumPy, PyTorch, a CUDA GPU, `nvcc`, Triton and vLLM, then tells you which lab tiers you can run:
+
+```text title="example output (a laptop with a small NVIDIA GPU)"
+  ✔ Python ≥ 3.10
+  ✔ numpy                  2.x
+  – torch                  optional: pip install torch
+  – CUDA GPU               NVIDIA GeForce RTX ... (install torch to use it)
+  – nvcc (CUDA C++)        needed for .cu labs in M4–M6
+
+You can run:
+  🟢 CPU labs             yes
+  🟡 GPU-optional labs    yes (CPU fallback) — and fast on your GPU
+  🔴 GPU-required labs    yes, after installing PyTorch and the CUDA toolkit (nvcc, for .cu labs)
+```
+
+### No NVIDIA GPU?
+
+- **Google Colab / Kaggle notebooks**: free T4 GPUs, enough for every kernel lab in Modules 4–8 and small-model serving.
+- **Rented GPUs by the hour**: needed only for the big serving labs (7–8B models in Modules 10–13, about 24 GB of GPU memory) and the
+  optional H100 sessions in the capstone. A whole module usually costs a few dollars.
+- **A small laptop GPU (4–8 GB)**: fine for all CUDA/Triton kernels and for serving 0.5–1.5B models.
+
+<Callout type="warning" title="Turn it off">
+  Rented GPUs bill while idle. Stop the instance when you finish a session, and write down the versions you used so your benchmarks
+  stay reproducible ([13.5](/learn/m13/benchmark-pitfalls)).
+</Callout>
+
+## Pick your path
+
+The roadmap is ordered for someone starting from zero. If you already know some of it, skip ahead, but don't skip the labs.
+
+| If you are… | Start at | You can skim |
+|---|---|---|
+| New to LLMs and GPUs | [M0](/learn/m00/what-is-inference-engineering) → in order | nothing |
+| An ML engineer who knows PyTorch | [M2 GPU first principles](/learn/m02/why-not-10000-cpu-cores) | most of M1 |
+| A CUDA programmer new to LLMs | [M1](/learn/m01/tokens-embeddings-logits), then [M3](/learn/m03/compute-vs-memory-bound) → [M8](/learn/m08/norms-fused-residual) | M4–M5 |
+| A backend/infra engineer | M0–M3 for the mental model, then [M9](/learn/m09/kv-cache-size) → [M13](/learn/m13/serving-metrics), then [M15](/learn/m15/why-disaggregate) | M4–M8 (come back later) |
+
+**Pace.** The [time-to-first-token](https://github.com/patchy631/time-to-first-token) course behind the serving modules assumes
+**30 minutes a day, 5 days a week**. That is a good default here too. One chapter is roughly one session.
+
+## How the sources fit together
+
+This curriculum stands on eight sources. Each one is strongest at a different layer of the stack from
+[0.1](/learn/m00/what-is-inference-engineering):
+
+- **Hardware and kernels**: *BEFORE-GPU-ENGINEERING* explains *why*, *100 Days of CUDA* shows *how* in code, and Fregly's book
+  connects both to PyTorch.
+- **Engines and serving**: *LLM Inference at Scale* builds intuition, and *time-to-first-token* has you build and measure a real service.
+- **At scale**: the *vLLM Router* post and the *Inference Control Plane* paper cover routing, disaggregation and the control layer.
+
+See every source and the modules that use it on the [sources page](/sources).
+
+## Sources
+
+<Sources>
+  <SourceCard id="TTFT" note="The 30-minutes-a-day pacing, the 'don't skip the build sessions' rule, and the rented-GPU budget." />
+  <SourceCard id="CUDA100" note="A model for learning in public: one small, runnable problem a day." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A chapter is marked 🔴 GPU required and you only have a laptop. What should you do?',
+      options: [
+        'Skip the chapter entirely',
+        'Read the concept and use the animation, then run the lab on Colab/Kaggle or a rented GPU when you are ready',
+        'Run it on CPU anyway; it is the same',
+        'Buy an H100',
+      ],
+      answer: 1,
+      explain: 'The concepts and animations need no GPU. Free notebook GPUs cover the kernel labs, and only the big serving labs need a rented GPU.',
+    },
+    {
+      q: 'What is the best way to use an interactive figure?',
+      options: [
+        'Watch it once',
+        'Push the controls to extremes and predict the result before you look',
+        'Ignore it and read the text',
+        'Screenshot it',
+      ],
+      answer: 1,
+      explain: 'Predicting, then checking, is what builds intuition. The edges (OOM, memory-bound, crossover points) are where the lessons are.',
+    },
+    {
+      q: 'You are a backend engineer who has never written CUDA. Which order fits you best?',
+      options: [
+        'M4 → M8 first, then everything else',
+        'M0–M3 for the mental model, then M9–M13, coming back to kernels later',
+        'Start at M16',
+        'Only read the sources',
+      ],
+      answer: 1,
+      explain: 'The roofline and KV-cache mental model (M0–M3) carry the serving modules. The kernel modules deepen it later.',
+    },
+  ]}
+/>

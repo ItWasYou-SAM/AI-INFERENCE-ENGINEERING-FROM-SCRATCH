@@ -1,0 +1,25 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import RoadmapExplorer from '../components/ui/RoadmapExplorer.tsx';
+import { levels, allChapters, allModules } from '../data/roadmap';
+
+const written = (await getCollection('chapters')).map((e) => e.id);
+---
+
+<BaseLayout title="Roadmap" description="From beginner to expert: the full curriculum for AI inference engineering.">
+  <section class="mx-auto max-w-4xl px-5 pt-14">
+    <p class="eyebrow rise">The curriculum</p>
+    <h1 class="rise mt-2 text-5xl sm:text-6xl" style="animation-delay:60ms">
+      From <span class="italic">“what is a token?”</span><br />to <span class="marker">running inference at scale</span>.
+    </h1>
+    <p class="rise mt-6 max-w-2xl text-lg text-ink-soft" style="animation-delay:120ms">
+      {levels.length} levels, {allModules.length} modules and {allChapters.length} chapters. Every chapter follows the same arc:{' '}
+      <b class="text-ink">concept → animation → code lab → sources → quiz</b>. Labs run on a CPU first, and the GPU labs are marked.
+      Your progress is saved in this browser.
+    </p>
+    <div class="mt-14">
+      <RoadmapExplorer client:load levels={levels} written={written} />
+    </div>
+  </section>
+</BaseLayout>

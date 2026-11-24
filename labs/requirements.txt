@@ -1,0 +1,6 @@
+# Tier 🟢 CPU labs
+numpy>=1.26
+# Tier 🟡/🔴 GPU labs (install on a CUDA machine or Colab)
+# torch>=2.4
+# triton
+# vllm

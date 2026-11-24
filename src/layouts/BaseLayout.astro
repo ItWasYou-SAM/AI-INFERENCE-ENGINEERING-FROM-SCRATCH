@@ -1,0 +1,88 @@
+---
+import { ClientRouter } from 'astro:transitions';
+import '@fontsource-variable/fraunces/full.css';
+import '@fontsource-variable/source-serif-4';
+import '@fontsource-variable/jetbrains-mono';
+import '../styles/global.css';
+import SiteHeader from '../components/ui/SiteHeader.astro';
+
+interface Props {
+  title: string;
+  description?: string;
+  wide?: boolean;
+}
+const { title, description = 'Learn AI inference engineering from first principles: GPUs, CUDA, KV caches, serving engines and distributed inference.' } = Astro.props;
+const fullTitle = title === 'Home' ? 'Inference Engineering, from Scratch' : `${title} · Inference Engineering`;
+---
+
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="64x64" href="/favicon-64.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <title>{fullTitle}</title>
+    <script is:inline>
+      (function () {
+        const apply = () => {
+          const saved = localStorage.getItem('theme');
+          const theme = saved || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.classList.add('js'); // survives view-transition swaps
+        };
+        apply();
+        document.addEventListener('astro:after-swap', apply);
+      })();
+    </script>
+    <ClientRouter />
+  </head>
+  <body>
+    <SiteHeader />
+    <main id="main">
+      <slot />
+    </main>
+    <footer class="mx-auto mt-24 max-w-6xl border-t border-dashed border-rule px-5 py-10 text-sm text-ink-soft">
+      <div class="flex flex-wrap items-baseline justify-between gap-4">
+        <p>
+          <span class="font-display text-ink">Inference Engineering, from Scratch</span> — built on open-source repos, books and papers.
+          See <a class="ink-link" href="/sources">sources</a>.
+        </p>
+        <p class="eyebrow">ink on paper · v0.1</p>
+      </div>
+    </footer>
+
+    <script>
+      // reveal-on-scroll for any element with .reveal
+      const revealAll = () => {
+        const io = new IntersectionObserver(
+          (entries) =>
+            entries.forEach((e) => {
+              if (e.isIntersecting) {
+                e.target.classList.add('in');
+                io.unobserve(e.target);
+              }
+            }),
+          { rootMargin: '0px 0px -8% 0px' },
+        );
+        document.querySelectorAll('.reveal:not(.in)').forEach((el) => io.observe(el));
+      };
+      document.addEventListener('astro:page-load', revealAll);
+    </script>
+    <script>
+      import Lenis from 'lenis';
+      const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (!reduce) {
+        const lenis = new Lenis({ lerp: 0.12, smoothWheel: true });
+        const raf = (t: number) => {
+          lenis.raf(t);
+          requestAnimationFrame(raf);
+        };
+        requestAnimationFrame(raf);
+        document.addEventListener('astro:after-swap', () => lenis.scrollTo(0, { immediate: true }));
+      }
+    </script>
+  </body>
+</html>

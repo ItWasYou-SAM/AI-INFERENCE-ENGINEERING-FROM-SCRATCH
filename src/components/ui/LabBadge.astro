@@ -1,0 +1,18 @@
+---
+import { labMeta, type Lab } from '../../data/roadmap';
+interface Props {
+  lab: Lab;
+  long?: boolean;
+}
+const { lab, long = false } = Astro.props;
+const meta = labMeta[lab];
+---
+
+<span
+  class="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 font-mono text-[0.65rem] tracking-wide uppercase"
+  style={`color:${meta.color};border-color:color-mix(in srgb, ${meta.color} 45%, transparent)`}
+  title={meta.label}
+>
+  <span class="h-1.5 w-1.5 rounded-full" style={`background:${meta.color}`}></span>
+  {long ? meta.label : meta.short}
+</span>

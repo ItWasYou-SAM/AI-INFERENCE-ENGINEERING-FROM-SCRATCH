@@ -1,0 +1,192 @@
+---
+summary: Every token a model has seen leaves keys and values behind in GPU memory. This chapter counts those bytes and turns the count into the number of users one GPU can serve.
+duration: 25 min
+objectives:
+  - Derive KV-cache bytes per token from a model's config
+  - Write the capacity equation and use it to size a deployment
+  - Explain why GQA, FP8 KV and long contexts move the answer so much
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import KVCapacityCalculator from '../../../components/viz/KVCapacityCalculator.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+To generate token $t$, attention needs the key and value vectors of **every earlier token**, in **every layer**.
+Recomputing them at each step would make generation quadratic, so the engine computes them once and keeps them in GPU memory.
+That stored state is the **KV cache**, and it is usually the thing that decides how many people one GPU can serve at once.
+
+## Where the bytes come from
+
+At each layer, a token contributes one key and one value vector for every KV head. Count them up:
+
+$$
+\text{KV}_{\text{token}} \;=\; \underbrace{2}_{K,\,V} \times n_{\text{layers}} \times n_{\text{kv-heads}} \times d_{\text{head}} \times \underbrace{b}_{\text{bytes/value}}
+$$
+
+For **Mistral 7B** (32 layers, 8 KV heads, head dimension 128, FP16):
+
+$$
+2 \times 32 \times 8 \times 128 \times 2 \;=\; 131{,}072 \text{ bytes} \;\approx\; \mathbf{131\ KB\ per\ token}
+$$
+
+131 KB doesn't sound like much. Multiply it by the context length, though:
+
+| Context (tokens) | KV per user |
+|---|---|
+| 1K | 0.13 GB |
+| 4K | 0.54 GB |
+| 16K | 2.15 GB |
+| 32K | 4.29 GB |
+| 128K | 17.18 GB |
+
+<Callout type="insight">
+  At 128K context, **one user's** KV cache (17 GB) is larger than the model's FP16 weights (14.5 GB). Long context is mostly a
+  memory problem, and only partly a compute problem.
+</Callout>
+
+## The GPU memory budget
+
+An A100-80GB serving Mistral 7B in FP16 splits its memory three ways:
+
+- **Weights**: 7.24 B parameters × 2 bytes ≈ **14.5 GB**. This is fixed.
+- **Overhead**: activations, the CUDA context, allocator fragmentation. Roughly **8 GB** here.
+- **KV cache**: everything left, about **57.5 GB**. This is the pool that concurrent requests share.
+
+## The capacity equation
+
+Divide the leftover memory by what one user costs:
+
+$$
+\text{max users} \;=\; \left\lfloor \frac{M_{\text{GPU}} - M_{\text{weights}} - M_{\text{overhead}}}{\text{KV}_{\text{token}} \times L_{\text{context}}} \right\rfloor
+$$
+
+- At **4K** context: $57.5 \text{ GB} \,/\, 0.54 \text{ GB} \approx$ **107 users**
+- At **16K** context: $57.5 \text{ GB} \,/\, 2.15 \text{ GB} \approx$ **26 users**
+
+Quadrupling the context cuts concurrency by four. Nothing about the model changed.
+
+## Play with it
+
+<Figure label="fig. 9.1" caption="The capacity equation, live. Each stripe in the blue segment is one user's KV cache. Push past the red line and the GPU runs out of memory.">
+  <KVCapacityCalculator client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Switch **Mistral 7B → Llama 2 7B (MHA)**. Without grouped-query attention it stores 32 KV heads instead of 8, which is 4× the
+     bytes per token. At 4K, capacity falls from 107 to **27** users.
+  2. Switch the **KV cache to FP8**. Bytes per token halve, so capacity doubles to **214**.
+  3. Pick **Llama 3.1 70B** with FP16 weights. The weights alone are 141 GB and don't fit at all. Switch the weights to **INT4**
+     (about 35 GB) and you get **27** users at 4K.
+  4. Drag the context to **128K** on any model and watch the concurrency collapse.
+</Callout>
+
+## Why this decides speed too, not only capacity
+
+During decode, every step reads the **whole KV cache of every sequence in the batch**, plus all the weights, to produce one token
+per sequence. Decode is memory-bandwidth-bound (see [3.3 The roofline model](/learn/m03/roofline)), so every extra KV byte is an extra byte
+of HBM traffic on every step.
+
+That is why so many later chapters attack the KV cache:
+
+- **Store fewer heads**: [9.2 MQA, GQA and MLA](/learn/m09/mqa-gqa-mla)
+- **Waste less of it**: [9.3 PagedAttention](/learn/m09/paged-attention) (naive engines reserve the maximum context for every request)
+- **Use fewer bits**: [9.6 KV-cache quantization](/learn/m09/kv-cache-quantization)
+- **Keep fewer tokens**: [9.7 attention sinks and eviction](/learn/m09/sinks-sliding-window-eviction)
+- **Share it**: [10.4 prefix caching](/learn/m10/prefix-caching-radix)
+
+## Lab: count the bytes yourself 🟢
+
+The lab computes the formula, then **allocates a real FP16 KV cache in NumPy** and checks that the byte count matches.
+
+```python title="labs/m09/9.1/kv_cache.py"
+def kv_bytes_per_token(m: Model, kv_bytes: float = 2) -> float:
+    # 2 tensors (K and V) per layer, each kv_heads x head_dim values
+    return 2 * m.layers * m.kv_heads * m.head_dim * kv_bytes
+
+
+def max_users(m: Model, gpu_gb: float, context: int, weight_bytes: float = 2,
+              kv_bytes: float = 2, overhead_gb: float = 8) -> int:
+    weights = m.params_b * 1e9 * weight_bytes
+    free = gpu_gb * GB - weights - overhead_gb * GB
+    if free <= 0:
+        return 0
+    return int(free // (kv_bytes_per_token(m, kv_bytes) * context))
+
+
+def measure_with_numpy(m: Model, tokens: int) -> int:
+    """Allocate a real FP16 KV cache (one sequence) and count its bytes."""
+    cache = [
+        (np.zeros((m.kv_heads, tokens, m.head_dim), dtype=np.float16),   # K
+         np.zeros((m.kv_heads, tokens, m.head_dim), dtype=np.float16))   # V
+        for _ in range(m.layers)
+    ]
+    return sum(k.nbytes + v.nbytes for k, v in cache)
+```
+
+```bash
+pip install numpy
+python labs/m09/9.1/kv_cache.py
+```
+
+```text title="output"
+Mistral 7B: KV per token = 131,072 B ≈ 131 KB
+NumPy check: 256 tokens -> 33,554,432 B (matches formula)
+...
+  Mistral 7B @ 4K -> 107 users
+  Mistral 7B @ 16K -> 26 users
+```
+
+<Callout type="note" title="Exercises">
+  1. Add Llama 3.1 8B. How many users fit on a 24 GB L4 at 4K?
+  2. At what context length does one Mistral 7B user's KV cache exceed the FP16 weights?
+  3. Model an 8-bit KV cache in `measure_with_numpy` and confirm that the bytes halve.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="MOHITH" note="The KV-size, memory-budget and capacity-equation sections. This chapter's numbers reproduce that post's figures." />
+  <SourceCard id="CUDA100" note="Day 47 (INT8 KV-cache attention) and Day 100 (paged KV-cache attention) implement what comes next." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A model has 40 layers, 8 KV heads, head dimension 128, and stores its KV cache in FP16. How many bytes of KV does one token take?',
+      options: ['81,920 B', '163,840 B', '327,680 B', '40,960 B'],
+      answer: 1,
+      explain: '2 × 40 × 8 × 128 × 2 = 163,840 bytes. Forgetting the factor of 2 for K and V gives 81,920.',
+    },
+    {
+      q: 'You double the context length you serve. With everything else fixed, the maximum number of concurrent users…',
+      options: ['stays the same', 'roughly halves', 'drops by 4×', 'roughly doubles'],
+      answer: 1,
+      explain: 'Per-user KV grows linearly with context, and capacity is free memory divided by per-user KV.',
+    },
+    {
+      q: 'Why does a model with grouped-query attention (8 KV heads, 32 query heads) fit about 4× more users than its multi-head-attention twin?',
+      options: [
+        'Its weights are 4× smaller',
+        'It stores K and V for 8 heads instead of 32',
+        'It computes attention 4× faster',
+        'It uses INT4 automatically',
+      ],
+      answer: 1,
+      explain: 'Only KV heads are cached. Query heads are recomputed every step, so 32 → 8 KV heads shrinks the cache by 4×.',
+    },
+    {
+      q: 'Why does a bigger KV cache also make each decode step slower, not only reduce capacity?',
+      options: [
+        'It adds FLOPs to the MLP',
+        'Decode is memory-bound, and every step must read every cached K and V from HBM',
+        'The tokenizer becomes slower',
+        'It forces a smaller batch size by law',
+      ],
+      answer: 1,
+      explain: 'At decode time arithmetic intensity is low, so step time is set by bytes moved, and the KV cache is a large share of those bytes.',
+    },
+  ]}
+/>

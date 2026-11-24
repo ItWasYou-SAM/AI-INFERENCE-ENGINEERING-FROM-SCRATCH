@@ -1,0 +1,428 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+/* ── Paper-canvas design tokens ─────────────────────────────── */
+:root,
+[data-theme='light'] {
+  --paper: #f4efe4;
+  --paper-2: #ebe4d3;
+  --paper-3: #e1d8c3;
+  --ink: #1f1b16;
+  --ink-soft: #5b5348;
+  --ink-faint: #8a8173;
+  --rule: #d3c8b1;
+  --grid: rgba(31, 78, 156, 0.07);
+  --blue: #1f4e9c;
+  --red: #b8382a;
+  --green: #2f7d4f;
+  --amber: #a86a12;
+  --highlight: rgba(242, 201, 76, 0.45);
+  --violet: #6a4cc2;
+  --teal: #1c7c78;
+  --blob-opacity: 0.34;
+  --blob-blend: multiply;
+  --grain-opacity: 0.09;
+  --grain-blend: multiply;
+  --shadow: 0 1px 0 rgba(31, 27, 22, 0.06), 0 8px 24px -12px rgba(31, 27, 22, 0.25);
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  /* "Night paper / blueprint" */
+  --paper: #121720;
+  --paper-2: #19202b;
+  --paper-3: #222b38;
+  --ink: #ebe5d6;
+  --ink-soft: #a9a293;
+  --ink-faint: #767063;
+  --rule: #2d3644;
+  --grid: rgba(122, 167, 255, 0.07);
+  --blue: #84adff;
+  --red: #ff8a78;
+  --green: #73d39b;
+  --amber: #f0c06a;
+  --highlight: rgba(240, 192, 106, 0.22);
+  --violet: #b6a0ff;
+  --teal: #6fd8d0;
+  --blob-opacity: 0.22;
+  --blob-blend: screen;
+  --grain-opacity: 0.06;
+  --grain-blend: screen;
+  --shadow: 0 1px 0 rgba(0, 0, 0, 0.3), 0 10px 30px -12px rgba(0, 0, 0, 0.6);
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-paper-2: var(--paper-2);
+  --color-paper-3: var(--paper-3);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-faint: var(--ink-faint);
+  --color-rule: var(--rule);
+  --color-blue: var(--blue);
+  --color-red: var(--red);
+  --color-green: var(--green);
+  --color-amber: var(--amber);
+  --color-violet: var(--violet);
+  --color-teal: var(--teal);
+  --font-display: 'Fraunces Variable', Georgia, serif;
+  --font-serif: 'Source Serif 4 Variable', Georgia, serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
+}
+
+@layer base {
+/* ── Base ───────────────────────────────────────────────────── */
+html {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-serif);
+  font-size: 18px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  min-height: 100vh;
+  background: var(--paper);
+  transition: background-color 0.4s ease, color 0.4s ease;
+}
+
+/* Paper grain: fixed SVG turbulence overlay */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 100;
+  opacity: var(--grain-opacity);
+  mix-blend-mode: var(--grain-blend);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.5 0 0 0 0 0.45 0 0 0 0 0.4 0 0 0 1.4 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+::selection {
+  background: var(--highlight);
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-display);
+  font-variation-settings: 'SOFT' 50, 'WONK' 0;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+a {
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px dashed var(--blue);
+  outline-offset: 3px;
+}
+
+}
+
+@layer components {
+/* Graph paper for diagram canvases */
+.graph-paper {
+  background-color: var(--paper-2);
+  background-image: linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* A card that looks like a sheet on the desk */
+.sheet {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+
+/* Hand-underlined link */
+.ink-link {
+  text-decoration: none;
+  background-image: linear-gradient(transparent 62%, var(--highlight) 62%);
+  background-size: 100% 100%;
+  transition: background-size 0.25s ease;
+}
+.ink-link:hover {
+  background-image: linear-gradient(transparent 0%, var(--highlight) 0%);
+}
+
+.marker {
+  background: linear-gradient(104deg, transparent 0.5%, var(--highlight) 2.5%, var(--highlight) 95%, transparent 98%);
+  padding: 0 0.15em;
+  border-radius: 0.2em;
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+/* ── Chapter prose ──────────────────────────────────────────── */
+.prose {
+  line-height: 1.72;
+  color: var(--ink);
+}
+.prose > :not(.wide) {
+  max-width: 42rem;
+}
+.prose > * + * {
+  margin-top: 1.1em;
+}
+.prose h2 {
+  font-size: 1.75rem;
+  margin-top: 2.4em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px dashed var(--rule);
+}
+.prose h3 {
+  font-size: 1.3rem;
+  margin-top: 1.8em;
+}
+.prose a {
+  color: var(--blue);
+  text-underline-offset: 3px;
+}
+.prose ul {
+  list-style: disc;
+  padding-left: 1.3em;
+}
+.prose ol {
+  list-style: decimal;
+  padding-left: 1.3em;
+}
+.prose li + li {
+  margin-top: 0.35em;
+}
+.prose li::marker {
+  color: var(--ink-faint);
+}
+.prose strong {
+  font-weight: 650;
+}
+.prose :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.82em;
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 0.08em 0.35em;
+}
+.prose blockquote {
+  border-left: 3px solid var(--blue);
+  padding-left: 1em;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+.prose table {
+  width: 100%;
+  font-size: 0.88em;
+  border-collapse: collapse;
+}
+.prose th,
+.prose td {
+  border-bottom: 1px solid var(--rule);
+  padding: 0.45em 0.6em;
+  text-align: left;
+}
+.prose th {
+  font-family: var(--font-mono);
+  font-size: 0.78em;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+}
+.prose td {
+  font-variant-numeric: tabular-nums;
+}
+.prose .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.6em 0;
+}
+.prose .expressive-code {
+  margin-top: 1.4em;
+  margin-bottom: 1.4em;
+}
+/* Components inside prose opt out of prose styling */
+.not-prose ol,
+.not-prose ul {
+  list-style: none;
+  padding-left: 0;
+}
+.not-prose li + li {
+  margin-top: 0;
+}
+.not-prose a {
+  color: inherit;
+}
+.not-prose :not(pre) > code {
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+/* Interactive figures use the full article column, wider than the text measure */
+.prose .wide {
+  width: 100%;
+}
+
+}
+
+/* ── Gradients ──────────────────────────────────────────────── */
+:root {
+  /* one hue only: ink-blue → blue */
+  --grad: linear-gradient(115deg, color-mix(in srgb, var(--blue) 70%, var(--ink)) 0%, var(--blue) 55%, color-mix(in srgb, var(--blue) 75%, var(--paper)) 100%);
+  --grad-cool: linear-gradient(120deg, var(--teal), var(--blue) 55%, var(--violet));
+  --grad-warm: linear-gradient(120deg, var(--violet), var(--red) 55%, var(--amber));
+}
+
+@layer components {
+  .grad-text {
+    background: var(--grad);
+    background-size: 220% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: grad-pan 9s ease-in-out infinite alternate;
+    padding-right: 0.12em; /* italic glyphs overhang the clip box */
+    margin-right: -0.04em;
+  }
+  .grad-border {
+    border: 1px solid transparent;
+    background:
+      linear-gradient(var(--paper), var(--paper)) padding-box,
+      var(--grad) border-box;
+  }
+  .grad-btn {
+    background: var(--grad);
+    background-size: 200% auto;
+    color: var(--paper);
+    transition: background-position 0.6s ease, transform 0.2s ease, box-shadow 0.3s ease;
+  }
+  .grad-btn:hover {
+    background-position: 100% 50%;
+    box-shadow: 0 10px 28px -10px color-mix(in srgb, var(--violet) 70%, transparent);
+  }
+
+  /* watercolor blobs */
+  .blob {
+    position: absolute;
+    border-radius: 9999px;
+    filter: blur(64px);
+    opacity: calc(var(--blob-opacity) * 0.6);
+    mix-blend-mode: var(--blob-blend);
+    pointer-events: none;
+    animation: drift 22s ease-in-out infinite alternate;
+  }
+
+  /* infinite marquee */
+  .marquee {
+    mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
+  }
+  .marquee-track {
+    display: flex;
+    width: max-content;
+    animation: marquee 48s linear infinite;
+  }
+  .marquee:hover .marquee-track {
+    animation-play-state: paused;
+  }
+
+  /* reveal on scroll (only when JS is running) */
+  html.js .reveal {
+    opacity: 0;
+    transform: translateY(26px);
+    transition: opacity 0.9s cubic-bezier(0.2, 0.7, 0.2, 1), transform 0.9s cubic-bezier(0.2, 0.7, 0.2, 1);
+    transition-delay: var(--d, 0ms);
+  }
+  html.js .reveal.in {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes grad-pan {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 100% 50%;
+  }
+}
+@keyframes drift {
+  0% {
+    transform: translate(0, 0) scale(1);
+  }
+  50% {
+    transform: translate(40px, -30px) scale(1.12);
+  }
+  100% {
+    transform: translate(-30px, 30px) scale(0.94);
+  }
+}
+@keyframes marquee {
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* ── Motion ─────────────────────────────────────────────────── */
+@keyframes draw-in {
+  from {
+    stroke-dashoffset: var(--len, 600);
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.js .reveal {
+    opacity: 1;
+    transform: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Lenis */
+html.lenis,
+html.lenis body {
+  height: auto;
+}
+.lenis.lenis-smooth {
+  scroll-behavior: auto !important;
+}
+.lenis.lenis-stopped {
+  overflow: hidden;
+}

@@ -1,0 +1,219 @@
+---
+import 'katex/dist/katex.min.css';
+import BaseLayout from './BaseLayout.astro';
+import LabBadge from '../components/ui/LabBadge.astro';
+import SourceCard from '../components/ui/SourceCard.astro';
+import { levels, allChapters, type FlatChapter } from '../data/roadmap';
+
+interface Props {
+  chapter: FlatChapter;
+  summary?: string;
+  duration?: string;
+  objectives?: string[];
+  headings?: { depth: number; slug: string; text: string }[];
+  written: Set<string>;
+}
+const { chapter, summary, duration, objectives = [], headings = [], written } = Astro.props;
+const idx = allChapters.findIndex((c) => c.key === chapter.key);
+const prev = allChapters[idx - 1];
+const next = allChapters[idx + 1];
+const toc = headings.filter((h) => h.depth === 2);
+const modLabel = chapter.module.id === 'capstone' ? 'Capstone' : `Module ${chapter.module.num}`;
+---
+
+<BaseLayout title={`${chapter.id} ${chapter.title}`} description={summary}>
+  <div class="mx-auto grid max-w-7xl gap-10 px-5 lg:grid-cols-[15rem_minmax(0,1fr)] xl:grid-cols-[15rem_minmax(0,1fr)_12rem]">
+    <!-- Sidebar: the whole roadmap, current module open -->
+    <aside class="hidden lg:block">
+      <nav class="sticky top-20 max-h-[calc(100vh-6rem)] overflow-y-auto pt-8 pr-2 pb-10 text-sm" data-lenis-prevent aria-label="Chapters">
+        {
+          levels.map((level) => (
+            <div class="mb-5">
+              <p class="eyebrow mb-2">
+                L{level.num} · {level.name}
+              </p>
+              {level.modules.map((m) => {
+                const open = m.id === chapter.module.id;
+                return (
+                  <details open={open} class="group mb-1">
+                    <summary class:list={['cursor-pointer list-none rounded px-2 py-1 leading-snug hover:bg-paper-2', open && 'font-semibold']}>
+                      <span class="mr-1 font-mono text-xs text-ink-faint">{m.id === 'capstone' ? 'C' : m.num}</span> {m.title}
+                    </summary>
+                    <ul class="mt-1 mb-2 ml-3 border-l border-dashed border-rule">
+                      {m.chapters.map((ch) => {
+                        const key = `${m.id}/${ch.slug}`;
+                        const here = key === chapter.key;
+                        return (
+                          <li>
+                            <a
+                              href={`/learn/${key}`}
+                              data-chapter-link={key}
+                              class:list={[
+                                'relative -ml-px flex gap-2 border-l py-1 pl-3 pr-1 leading-snug transition-colors',
+                                here ? 'border-blue text-ink' : 'border-transparent text-ink-soft hover:text-ink',
+                                !written.has(key) && !here && 'opacity-60',
+                              ]}
+                            >
+                              <span class="shrink-0 font-mono text-[0.7rem] text-ink-faint">{ch.id}</span>
+                              <span>{ch.title}</span>
+                            </a>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </details>
+                );
+              })}
+            </div>
+          ))
+        }
+      </nav>
+    </aside>
+
+    <article class="min-w-0 pt-10">
+      <header class="rise mb-10 max-w-[42rem]">
+        <p class="eyebrow mb-3">
+          L{chapter.level.num} {chapter.level.name} · {modLabel}: {chapter.module.title}
+        </p>
+        <h1 class="text-4xl sm:text-5xl" transition:name={`ch-${chapter.key}`}>
+          <span class="mr-2 font-mono text-2xl text-ink-faint sm:text-3xl">{chapter.id}</span>
+          {chapter.title}
+        </h1>
+        {summary && <p class="mt-4 text-lg text-ink-soft">{summary}</p>}
+        <div class="mt-5 flex flex-wrap items-center gap-2">
+          {chapter.lab && <LabBadge lab={chapter.lab} long />}
+          {chapter.interactive && <span class="rounded-full border border-blue/40 px-2 py-0.5 font-mono text-[0.65rem] tracking-wide text-blue uppercase">✦ Interactive</span>}
+          {duration && <span class="font-mono text-xs text-ink-faint">~{duration}</span>}
+        </div>
+        {
+          objectives.length > 0 && (
+            <div class="mt-7 rounded-lg border border-dashed border-rule p-4">
+              <p class="eyebrow mb-2">By the end you will be able to</p>
+              <ul class="space-y-1 text-[0.95rem]">
+                {objectives.map((o) => (
+                  <li class="flex gap-2">
+                    <span class="text-green">✓</span>
+                    {o}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )
+        }
+      </header>
+
+      <div class="prose">
+        <slot />
+      </div>
+
+      <div class="mt-14 max-w-[42rem]">
+        <button
+          type="button"
+          id="mark-done"
+          data-key={chapter.key}
+          class="rounded-full border border-dashed border-ink-soft px-4 py-2 font-mono text-xs tracking-wide uppercase transition hover:border-green hover:text-green data-[done=true]:border-green data-[done=true]:bg-green/10 data-[done=true]:text-green"
+        >
+          Mark chapter complete
+        </button>
+      </div>
+
+      <nav class="mt-10 grid max-w-[42rem] gap-3 sm:grid-cols-2" aria-label="Chapter navigation">
+        {
+          prev ? (
+            <a href={prev.path} class="sheet p-4 transition hover:-translate-y-0.5">
+              <span class="eyebrow">← Previous · {prev.id}</span>
+              <span class="mt-1 block font-display leading-snug">{prev.title}</span>
+            </a>
+          ) : (
+            <span />
+          )
+        }
+        {
+          next && (
+            <a href={next.path} class="sheet p-4 text-right transition hover:-translate-y-0.5">
+              <span class="eyebrow">Next · {next.id} →</span>
+              <span class="mt-1 block font-display leading-snug">{next.title}</span>
+            </a>
+          )
+        }
+      </nav>
+    </article>
+
+    <aside class="hidden xl:block">
+      {
+        toc.length > 0 && (
+          <nav class="sticky top-20 pt-10 text-sm" aria-label="On this page">
+            <p class="eyebrow mb-3">On this page</p>
+            <ul class="space-y-2 border-l border-dashed border-rule">
+              {toc.map((h) => (
+                <li>
+                  <a href={`#${h.slug}`} data-toc={h.slug} class="-ml-px block border-l border-transparent pl-3 text-ink-soft transition-colors hover:text-ink">
+                    {h.text}
+                  </a>
+                </li>
+              ))}
+            </ul>
+            <p class="eyebrow mt-8 mb-2">Module sources</p>
+            <div class="space-y-2">
+              {chapter.module.sources.map((s) => (
+                <SourceCard id={s.id} note={s.note} />
+              ))}
+            </div>
+          </nav>
+        )
+      }
+    </aside>
+  </div>
+</BaseLayout>
+
+<script>
+  import { getDone, setDone } from '../lib/progress';
+
+  function init() {
+    const btn = document.getElementById('mark-done') as HTMLButtonElement | null;
+    if (btn) {
+      const key = btn.dataset.key!;
+      const render = () => {
+        const done = getDone().has(key);
+        btn.dataset.done = String(done);
+        btn.textContent = done ? '✓ Completed' : 'Mark chapter complete';
+      };
+      render();
+      btn.onclick = () => {
+        setDone(key, !getDone().has(key));
+        render();
+      };
+    }
+    // Tick completed chapters in the sidebar
+    const done = getDone();
+    document.querySelectorAll<HTMLAnchorElement>('[data-chapter-link]').forEach((a) => {
+      if (done.has(a.dataset.chapterLink!)) {
+        const tag = a.querySelector('span')!;
+        tag.textContent = '✓';
+        tag.style.color = 'var(--green)';
+      }
+    });
+    // Scroll-spy for the ToC
+    const links = document.querySelectorAll<HTMLAnchorElement>('[data-toc]');
+    if (links.length) {
+      const io = new IntersectionObserver(
+        (entries) => {
+          for (const e of entries) {
+            if (!e.isIntersecting) continue;
+            links.forEach((l) => {
+              const on = l.dataset.toc === e.target.id;
+              l.style.color = on ? 'var(--ink)' : '';
+              l.style.borderColor = on ? 'var(--blue)' : '';
+            });
+          }
+        },
+        { rootMargin: '-15% 0px -75% 0px' },
+      );
+      links.forEach((l) => {
+        const el = document.getElementById(l.dataset.toc!);
+        if (el) io.observe(el);
+      });
+    }
+  }
+  document.addEventListener('astro:page-load', init);
+</script>

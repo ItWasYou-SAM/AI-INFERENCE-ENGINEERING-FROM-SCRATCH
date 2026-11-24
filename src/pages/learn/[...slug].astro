@@ -1,0 +1,54 @@
+---
+import { getCollection, render } from 'astro:content';
+import ChapterLayout from '../../layouts/ChapterLayout.astro';
+import Callout from '../../components/ui/Callout.astro';
+import SourceCard from '../../components/ui/SourceCard.astro';
+import { allChapters } from '../../data/roadmap';
+
+export async function getStaticPaths() {
+  const entries = await getCollection('chapters');
+  const written = new Set(entries.map((e) => e.id));
+  return allChapters.map((chapter) => ({
+    params: { slug: chapter.key },
+    props: { chapter, entry: entries.find((e) => e.id === chapter.key), written },
+  }));
+}
+
+const { chapter, entry, written } = Astro.props;
+const rendered = entry ? await render(entry) : null;
+const Content = rendered?.Content;
+---
+
+<ChapterLayout
+  chapter={chapter}
+  summary={entry?.data.summary ?? chapter.module.tagline}
+  duration={entry?.data.duration}
+  objectives={entry?.data.objectives}
+  headings={rendered?.headings}
+  written={written}
+>
+  {
+    Content ? (
+      <Content />
+    ) : (
+      <>
+        <Callout type="note" title="Being written">
+          <p>
+            This chapter is on the roadmap but hasn't been written yet. Until it is, the module sources below are the best place to
+            study it.
+          </p>
+        </Callout>
+        <h2 id="sources">Sources for this module</h2>
+        <div class="not-prose my-6 grid gap-3 sm:grid-cols-2">
+          {chapter.module.sources.map((s) => (
+            <SourceCard id={s.id} note={s.note} />
+          ))}
+        </div>
+        <p>
+          Finished chapters so far: <a href="/learn/m03/roofline">3.3 The roofline model</a> and{' '}
+          <a href="/learn/m09/kv-cache-size">9.1 How big is the KV cache?</a>
+        </p>
+      </>
+    )
+  }
+</ChapterLayout>

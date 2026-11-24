@@ -1,0 +1,166 @@
+---
+summary: One picture, two numbers. The roofline model tells you whether a kernel is waiting on memory or on math, and it explains why LLM decode leaves most of a GPU idle.
+duration: 20 min
+objectives:
+  - Draw a roofline from a GPU's peak FLOP/s and memory bandwidth
+  - Place a matmul on it using arithmetic intensity
+  - Explain why decode is memory-bound and prefill is compute-bound, and what batching does about it
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import RooflinePlot from '../../../components/viz/RooflinePlot.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Every kernel does two things: it **moves bytes** between HBM and the chip, and it **does math** on them. Whichever takes longer sets
+the speed. The roofline model turns that observation into a single plot.
+
+## Two ceilings
+
+A GPU has two hard limits:
+
+- **Peak compute** $P$: how many FLOP/s the tensor cores can do. An H100 SXM does about **989 TFLOP/s** in dense BF16.
+- **Memory bandwidth** $B$: how many bytes/s HBM can deliver. An H100 SXM delivers about **3.35 TB/s**.
+
+A kernel's **arithmetic intensity** $I$ is the work it does per byte it moves:
+
+$$
+I = \frac{\text{FLOPs}}{\text{bytes moved}} \quad \left[\tfrac{\text{FLOP}}{\text{byte}}\right]
+$$
+
+The best throughput it can reach is the lower of the two ceilings:
+
+$$
+\text{attainable FLOP/s} = \min\left(P,\; B \times I\right)
+$$
+
+On a log-log plot that is a slanted line (bandwidth-limited) meeting a flat roof (compute-limited). They cross at the **ridge point**
+$I^{*} = P / B$, which is about **295 FLOP/byte** on an H100. Below the ridge the tensor cores sit idle waiting for data.
+
+<Callout type="insight">
+  295 FLOP per byte is a lot. A kernel has to reuse every byte it loads about 300 times before the H100's math units become the
+  bottleneck.
+</Callout>
+
+## Placing an LLM layer on the roof
+
+Take one linear layer, $Y = XW$, with $W$ of size $d \times d$ and $M$ tokens in $X$. Everything is FP16 (2 bytes).
+
+$$
+\text{FLOPs} = 2Md^2 \qquad \text{bytes} = 2\,(Md + d^2 + Md) \qquad I = \frac{Md}{d + 2M}
+$$
+
+When $M \ll d$, this simplifies to $I \approx M$: **arithmetic intensity is about the number of tokens processed per step**.
+
+- **Decode** produces one token per sequence per step, so $M$ is the **batch size**. At batch 1, $I \approx 1$, and the H100 runs
+  at about **0.3%** of peak.
+- **Prefill** processes the whole prompt at once, so $M$ is the **prompt length**. At 2,048 tokens, $I \approx 1{,}024$, which is
+  compute-bound at 100%.
+
+## Play with it
+
+<Figure label="fig. 3.3" caption="A roofline for one 4096×4096 FP16 layer. Drag the red decode dot or the blue prefill dot, or switch GPUs and watch the ridge move.">
+  <RooflinePlot client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Leave decode at **batch 1** and switch between GPUs. Every GPU is memory-bound, so a faster GPU only helps if it also has more
+     bandwidth.
+  2. Raise the decode batch until the red dot reaches the roof. On an H100 that takes about **345** sequences, and on an A100 about **165**.
+  3. Switch to the **L4**. Its bandwidth is low (0.3 TB/s) compared with its compute, so its ridge sits far to the right.
+</Callout>
+
+## What this means for serving
+
+This one plot explains most of the inference stack:
+
+- **Batching is the main lever for decode.** Each extra sequence in a step reuses the same weight bytes, which raises $I$.
+  That is why serving engines do [continuous batching](/learn/m10/continuous-batching).
+- **Prefill and decode want different things.** Prefill wants FLOP/s. Decode wants bandwidth. That mismatch motivates
+  [chunked prefill](/learn/m10/chunked-prefill) and, at scale, [disaggregated serving](/learn/m15/why-disaggregate).
+- **Quantization helps decode for free.** INT4 weights move a quarter of the bytes, so $I$ quadruples for the same work
+  (see [Module 12](/learn/m12/number-formats)).
+
+<Callout type="warning" title="The catch">
+  The batching argument applies to weight matmuls only. Attention over the KV cache is different: every sequence brings its **own** K
+  and V, so batching does not raise attention's intensity. As context grows, attention takes a larger share of decode time, and it
+  stays memory-bound however large the batch. That is why [the KV cache](/learn/m09/kv-cache-size) gets a whole module.
+</Callout>
+
+## Lab: compute the roofline yourself 🟢
+
+```python title="labs/m03/3.3/roofline.py"
+def intensity(m: int) -> float:
+    return flops(m) / bytes_moved(m)          # 2*m*d*d / 2*(m*d + d*d + m*d)
+
+def attainable(gpu: str, ai: float) -> float:
+    peak, bw = GPUS[gpu]
+    return min(peak, bw * ai)                  # TB/s * FLOP/B = TFLOP/s
+```
+
+```bash
+python labs/m03/3.3/roofline.py
+```
+
+```text title="output"
+H100 SXM: peak 989 TFLOP/s, 3.35 TB/s -> ridge 295 FLOP/B
+
+phase         M   AI (FLOP/B)   TFLOP/s   % peak  bound
+decode        1           1.0       3.3     0.3%  memory
+decode        8           8.0      26.7     2.7%  memory
+decode       64          62.1     207.9    21.0%  memory
+decode      256         227.6     762.3    77.1%  memory
+prefill     512         409.6     989.0   100.0%  compute
+prefill    2048        1024.0     989.0   100.0%  compute
+```
+
+<Callout type="note" title="Exercises">
+  1. Change the weights to INT4 (0.5 bytes) while keeping activations FP16. What decode batch now reaches the H100 ridge?
+  2. Add the attention read for a 4K context per sequence to `bytes_moved`. Does decode ever reach the ridge?
+  3. **GPU (optional):** time `torch.matmul` for M = 1…1024 on a real GPU and plot measured TFLOP/s against this model.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Ch 33–35: idle ALUs, arithmetic intensity, and the two hard ceilings." />
+  <SourceCard id="TTFT" note="Week 1: roofline, arithmetic intensity, and why decode is memory-bound. Its deliverable is the hand derivation in chapter 3.5." />
+  <SourceCard id="MOHITH" note="The two phases of inference: prefill sets TTFT, decode sets TPOT." />
+  <SourceCard id="FREGLY" note="The arithmetic-intensity and kernel-optimization chapters." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A GPU has 400 TFLOP/s of peak compute and 2 TB/s of bandwidth. Where is its ridge point?',
+      options: ['20 FLOP/B', '200 FLOP/B', '800 FLOP/B', '0.005 FLOP/B'],
+      answer: 1,
+      explain: 'Ridge = P / B = 400e12 / 2e12 = 200 FLOP per byte.',
+    },
+    {
+      q: 'For a d×d FP16 linear layer with M ≪ d, arithmetic intensity is about…',
+      options: ['d', 'M', 'M × d', '1, regardless of M'],
+      answer: 1,
+      explain: 'I = Md / (d + 2M) ≈ M when M is small: roughly one FLOP per byte for each token in the step.',
+    },
+    {
+      q: 'Why is single-user decode slow even on the most powerful GPU?',
+      options: [
+        'The model has too many FLOPs',
+        'Each step reads all the weights to produce one token, so intensity is about 1 and memory bandwidth sets the pace',
+        'The tokenizer is single-threaded',
+        'Tensor cores cannot run FP16',
+      ],
+      answer: 1,
+      explain: 'With intensity ≈ 1 the kernel runs at B × 1, about 3.35 TFLOP/s on an H100, or 0.3% of peak.',
+    },
+    {
+      q: 'Which change raises the arithmetic intensity of decode weight matmuls?',
+      options: ['A longer context', 'A bigger batch', 'A higher temperature', 'A larger vocabulary'],
+      answer: 1,
+      explain: 'More sequences per step reuse the same weight bytes. A longer context adds KV bytes, which does not help.',
+    },
+  ]}
+/>

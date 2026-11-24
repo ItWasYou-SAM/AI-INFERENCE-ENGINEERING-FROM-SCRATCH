@@ -1,0 +1,19 @@
+---
+interface Props {
+  caption?: string;
+  label?: string;
+}
+const { caption, label } = Astro.props;
+---
+
+<figure class="wide my-10">
+  <div class="sheet graph-paper overflow-hidden p-4 sm:p-6"><slot /></div>
+  {
+    caption && (
+      <figcaption class="mt-3 text-sm text-ink-soft">
+        {label && <span class="eyebrow mr-2 text-ink">{label}</span>}
+        {caption}
+      </figcaption>
+    )
+  }
+</figure>
