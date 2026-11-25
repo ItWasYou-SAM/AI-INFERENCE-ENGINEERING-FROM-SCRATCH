@@ -1,0 +1,114 @@
+---
+summary: GPU threads come in groups of 32 called warps, and a warp shares one instruction stream. When threads in a warp disagree at an if, the warp runs both sides. This chapter shows what that costs and how kernel authors avoid it.
+duration: 15 min
+objectives:
+  - Explain SIMT and the relationship between threads, warps and lanes
+  - Predict the cost of a divergent branch from the branch pattern
+  - Distinguish warp-uniform branches, which are free, from divergent ones
+  - Recognize branch-free patterns used in inference kernels
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import WarpDivergence from '../../../components/viz/WarpDivergence.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+In [2.1](/learn/m02/why-not-10000-cpu-cores) we said a GPU shares one instruction decoder across 32 lanes. This chapter shows what that
+means for the code you write.
+
+## SIMT: one instruction, many threads
+
+You write a CUDA kernel as code for **one thread**. The hardware groups threads into **warps** of 32 and runs each warp as a unit: one
+instruction is fetched and decoded, then executed by all 32 **lanes** at once, each on its own data. NVIDIA calls this **SIMT**, single
+instruction, multiple threads.
+
+$$
+\text{thread block} = \text{several warps} \qquad \text{warp} = 32 \text{ threads in lockstep} \qquad \text{lane} = \text{one thread's slot in its warp}
+$$
+
+When all 32 threads want the same instruction, SIMT costs nothing: you get 32 results for one instruction's worth of control logic. The
+question is what happens when they don't.
+
+## Divergence
+
+Suppose half the threads in a warp take an `if` and half take the `else`. The warp can only issue one instruction at a time, so it runs
+the `if` body with the `else` lanes **masked off**, then the `else` body with the `if` lanes masked off. The two paths run one after the
+other, and during each one some lanes do nothing.
+
+<Figure label="fig. 2.4" caption="One warp hitting a branch. Choose a branch condition and the length of each body, and see which lanes are active during each pass and how much of the warp's work is wasted.">
+  <WarpDivergence client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Compare **lane &lt; 16** and **lane % 2**. They cost the same: the hardware only cares *whether* lanes disagree, not which ones.
+  2. Pick **lane == 0** and make the if-body 20 instructions long. One lane forces the other 31 to wait 20 instructions.
+  3. Pick **warp_id % 2**. Every lane in a warp agrees, so the branch is free. Branching per warp, or per block, costs nothing.
+</Callout>
+
+The cost of a divergent branch is the **sum** of its paths instead of their maximum. Nested divergent branches can serialize further.
+Since the Volta architecture each thread has its own program counter, which makes some synchronization patterns legal, but divergent paths
+within a warp still execute one after another.
+
+## How kernels avoid it
+
+- **Branch on warp- or block-level values.** Choose work by `blockIdx` or warp index so all lanes of a warp agree.
+- **Compute both sides and select.** For short bodies, `y = cond ? a : b` compiles to a select or predicated instructions with no
+  divergence. The attention mask in [1.3](/learn/m01/attention-step-by-step) works this way: scores are replaced by $-\infty$ with a select, not skipped with an `if`.
+- **Sort or group the data.** If items need different work, group similar items together so each warp gets a uniform batch.
+- **Pad.** Variable-length sequences are often padded to a common length per tile so every lane runs the same loop count, and the
+  padding is masked out at the end ([9.4](/learn/m09/varlen-cu-seqlens)).
+
+<Callout type="insight" title="Lockstep also shapes memory access">
+  Because a warp's 32 lanes issue each load together, the addresses they touch together matter. When the 32 addresses are adjacent, the
+  hardware combines them into a few wide transactions; when they are scattered, it needs up to 32. That is **coalescing**, and it often
+  matters more than divergence. Chapter [4.7](/learn/m04/coalesced-vs-strided) measures it.
+</Callout>
+
+<Callout type="note" title="Exercises">
+  1. A warp hits `if (lane < 8) A else B`, where A is 10 instructions and B is 4. How many instructions does the warp issue, and what is the lane efficiency?
+  2. Rewrite `if (x > 0) y = x; else y = 0.1f * x;` (leaky ReLU) without a branch.
+  3. A kernel processes sequences of very different lengths, one sequence per thread. Why is that a bad mapping, and what would you do instead?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 1: warps, SIMT execution and branch divergence." />
+  <SourceCard id="FREGLY" note="GPU architecture chapters: warp schedulers and independent thread scheduling on Volta and later." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'How many threads are in a warp on NVIDIA GPUs?',
+      options: ['8', '16', '32', '1,024'],
+      answer: 2,
+      explain: 'A warp is 32 threads that issue instructions together.',
+    },
+    {
+      q: 'Half a warp takes an if-body of 6 instructions and half takes an else-body of 6. How many instructions does the warp issue?',
+      options: ['6', '12', '3', '192'],
+      answer: 1,
+      explain: 'Divergent paths run one after the other: 6 + 6 = 12, each with half the lanes masked off.',
+    },
+    {
+      q: 'Which branch causes no divergence?',
+      options: ['if (threadIdx.x % 2)', 'if (threadIdx.x < 16)', 'if (blockIdx.x % 2)', 'if (data[threadIdx.x] > 0)'],
+      answer: 2,
+      explain: 'All threads in a block share blockIdx, so every lane in every warp of the block agrees.',
+    },
+    {
+      q: 'How is a causal attention mask usually applied inside a kernel?',
+      options: [
+        'An if that skips future positions for each thread',
+        'A select that replaces future scores with −∞, with no divergent branch',
+        'A separate kernel launch per row',
+        'It is applied on the CPU',
+      ],
+      answer: 1,
+      explain: 'Selects and predication keep all lanes on the same instruction stream. (Whole tiles that are entirely masked can be skipped per block.)',
+    },
+  ]}
+/>

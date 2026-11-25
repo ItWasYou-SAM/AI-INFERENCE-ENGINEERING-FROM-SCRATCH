@@ -1,0 +1,131 @@
+---
+summary: Each GPU generation adds arithmetic faster than it adds memory bandwidth. That widening gap, the memory wall, is why HBM exists, why it is the most expensive part of an accelerator, and why LLM decode is limited by memory.
+duration: 15 min
+objectives:
+  - Describe the memory wall with numbers from recent GPU generations
+  - Explain how HBM achieves its bandwidth, and what it costs
+  - Compare HBM with GDDR and say where each is used
+  - Connect the memory wall to decode speed and to the roofline ridge point
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Arithmetic is easy to add to a chip: more lanes, wider tensor cores, lower precision. Bandwidth is hard to add, because every byte has to
+cross the edge of the chip through physical wires. Over time, the two have drifted apart.
+
+## The gap, in numbers
+
+| GPU | Year | Dense FP16/BF16 tensor | Memory bandwidth | FLOP per byte (ridge) |
+|:--|:--|--:|--:|--:|
+| V100 SXM2 | 2017 | 125 TFLOP/s | 0.90 TB/s | 139 |
+| A100 SXM 80GB | 2020 | 312 TFLOP/s | 2.04 TB/s | 153 |
+| H100 SXM | 2022 | 989 TFLOP/s | 3.35 TB/s | 295 |
+| H200 SXM | 2024 | 989 TFLOP/s | 4.8 TB/s | 206 |
+| B200 | 2024 | ~2,250 TFLOP/s | ~8 TB/s | ~281 |
+
+From V100 to B200, tensor throughput grew about **18×** while bandwidth grew about **9×**. The ridge point, the arithmetic intensity a
+kernel needs before compute becomes the limit ([3.3](/learn/m03/roofline)), has roughly doubled. A kernel that was balanced on a V100 is
+memory-bound on a B200. This growing imbalance is called the **memory wall**.
+
+<Callout type="insight" title="What this means for decode">
+  Decode at small batch has an arithmetic intensity of about 1–10 FLOP per byte, far below every ridge point in the table. For decode, the
+  column that sets speed is **bandwidth**. The H200 has the same compute as the H100 but 43% more bandwidth, and it decodes about that much
+  faster. Compute upgrades alone do little for decode.
+</Callout>
+
+## How HBM gets its bandwidth
+
+Bandwidth is roughly **bus width × transfer rate per wire**. Ordinary DRAM and GDDR sit on a circuit board, where each wire is long, so the
+bus is narrow (64 bits per DDR channel, 384 bits on an RTX 4090) and the wires have to run very fast.
+
+**High Bandwidth Memory** goes wide instead:
+
+- Several DRAM dies are **stacked** vertically and connected by thousands of through-silicon vias (TSVs).
+- Each stack has a **1,024-bit** interface, 16 times wider than a DDR channel.
+- The stacks sit on a silicon **interposer** right beside the GPU die, millimetres away, so all those wires are short and dense.
+
+An H100 SXM uses five active HBM3 stacks: a 5,120-bit bus delivering 3.35 TB/s from 80 GB. An RTX 4090's GDDR6X reaches about 1 TB/s from
+24 GB with a 384-bit bus running much faster per pin.
+
+| | GDDR6X (RTX 4090) | HBM3 (H100 SXM) |
+|:--|:--|:--|
+| Placement | separate chips on the board | stacked beside the die, on an interposer |
+| Bus width | 384 bits | 5,120 bits |
+| Bandwidth | ~1.0 TB/s | 3.35 TB/s |
+| Capacity | 24 GB | 80 GB |
+| Cost and supply | cheap, plentiful | expensive, supply-limited packaging |
+
+<Callout type="warning" title="The cost of the wall">
+  HBM and its advanced packaging are a large part of an accelerator's cost, and their supply has limited how many GPUs could be built.
+  Capacity is a wall too: an 80 GB GPU cannot hold a 70B model in BF16 (140 GB) at all. Every byte of HBM is fought over by weights and
+  KV cache ([9.1](/learn/m09/kv-cache-size)).
+</Callout>
+
+## The speed limit, as a formula
+
+If a decode step has to read the weights $W$ bytes and the batch's KV cache $K$ bytes from HBM with bandwidth $B$, then no kernel can make the
+step faster than
+
+$$
+t_{\text{step}} \;\geq\; \frac{W + K}{B}.
+$$
+
+For Llama-3-8B in BF16 on an H100 at short context: $16\ \text{GB} / 3.35\ \text{TB/s} \approx 4.8\ \text{ms}$, so at most about
+**210 tokens/s** for a single stream, however clever the kernels are. The ways around it are all about bytes: read fewer
+([quantization](/learn/m12/number-formats)), share each read across more requests ([batching](/learn/m10/continuous-batching)), or
+spread the bytes over more GPUs' worth of bandwidth ([tensor parallelism](/learn/m14/tensor-parallelism)).
+
+<Callout type="note" title="Exercises">
+  1. Using the formula, what is the single-stream upper bound for Llama-3-70B in FP8 (70 GB) split across 4 H100s?
+  2. Why do H200 and H100 have the same peak FLOP/s but different decode speeds? Which serving workloads would *not* benefit from an H200?
+  3. Look up a current consumer GPU's memory bus width and data rate. Compute its bandwidth and compare with the spec sheet.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 1: the memory wall and HBM." />
+  <SourceCard id="FREGLY" note="GPU architecture chapters: HBM generations and their effect on AI workloads." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'What is the memory wall?',
+      options: [
+        'A physical barrier inside the GPU',
+        'The growing gap between how fast chips compute and how fast memory can feed them',
+        'The maximum memory capacity of a GPU',
+        'A limit on the number of threads',
+      ],
+      answer: 1,
+      explain: 'Compute has grown faster than bandwidth for years, so more and more workloads are limited by memory.',
+    },
+    {
+      q: 'How does HBM achieve high bandwidth?',
+      options: [
+        'Much higher clock speeds than GDDR',
+        'A very wide bus from stacked dies placed right next to the GPU on an interposer',
+        'Compression of all data',
+        'Using SRAM instead of DRAM',
+      ],
+      answer: 1,
+      explain: 'Each stack has a 1,024-bit interface. Short, dense wires on the interposer make that width practical.',
+    },
+    {
+      q: 'An H200 has the same peak compute as an H100 but 4.8 TB/s instead of 3.35 TB/s. What happens to batch-1 decode speed?',
+      options: ['Nothing', 'It rises by roughly 43%', 'It doubles', 'It falls'],
+      answer: 1,
+      explain: 'Decode is memory-bound, so it scales with bandwidth: 4.8 / 3.35 ≈ 1.43.',
+    },
+    {
+      q: 'Llama-3-8B in BF16 is 16 GB. What is the best possible single-stream decode rate on a 3.35 TB/s GPU?',
+      options: ['About 21 tokens/s', 'About 210 tokens/s', 'About 2,100 tokens/s', 'About 62,000 tokens/s'],
+      answer: 1,
+      explain: 'Each step reads 16 GB: 16 / 3350 s ≈ 4.8 ms per token, so about 210 tokens per second.',
+    },
+  ]}
+/>

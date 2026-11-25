@@ -1,0 +1,137 @@
+---
+summary: A GPU is fast at big, regular, parallel work on data that already lives in its memory. Everything else, including small jobs, branchy logic, data that would have to cross the bus for one use, and most of the control logic of a serving engine, is often better on the CPU.
+duration: 15 min
+objectives:
+  - Estimate the break-even size at which offloading work to a GPU pays off
+  - List the workload properties that make a GPU a poor fit
+  - Identify which parts of an inference server belong on the CPU
+  - Recognize when CPU inference is the right answer
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Every chapter so far has been about making GPUs go fast. This one is about recognizing work that shouldn't go to a GPU at all.
+
+## The break-even test
+
+Offloading pays off only if
+
+$$
+T_{\text{CPU}} \;>\; T_{\text{to GPU}} + T_{\text{launch}} + T_{\text{GPU}} + T_{\text{back}}
+$$
+
+Put numbers from this module into it. Add two vectors of 1 M floats (12 MB of traffic):
+
+| Where the data is | CPU (one thread, ~24 GB/s) | GPU, including what it must move |
+|:--|--:|--:|
+| In host memory, result needed on host | ~0.5 ms | copy 8 MB in + 4 MB out at ~13 GB/s ≈ 0.9 ms, plus ~0.08 ms of kernel |
+| Already in GPU memory, result stays there | ~0.5 ms | ~0.08 ms of kernel + ~3 µs launch |
+
+The same operation loses on the GPU in the first row and wins by about 6× in the second. **Where the data lives decides it.** A cheap
+operation on data that has to cross the bus once and come back is a loss; a cheap operation on data already in HBM, followed by more GPU work,
+is a win.
+
+## Signs that work belongs on the CPU
+
+- **It's small.** A few thousand elements can't fill 270,000 thread slots ([2.2](/learn/m02/what-parallelizable-means)), and a few
+  microseconds of launch overhead may exceed the work itself ([4.6](/learn/m04/launch-async-streams)).
+- **It's sequential.** A chain where each step needs the previous one gets nothing from parallel hardware, and a single GPU thread is much
+  slower than a CPU core ([2.1](/learn/m02/why-not-10000-cpu-cores)).
+- **It's branchy and irregular.** Parsing, string handling and pointer-chasing data structures diverge within warps and access memory
+  randomly ([2.4](/learn/m02/warps-simt-branching), [4.7](/learn/m04/coalesced-vs-strided)).
+- **The data would cross the bus for one use.** Moving data costs more than a light computation on it ([4.3](/learn/m04/host-device-memory)).
+- **It needs system services.** Files, networks and most libraries are on the CPU side.
+
+## The CPU's job in an inference server
+
+A serving engine is a GPU program wrapped in a lot of CPU work:
+
+| On the CPU | On the GPU |
+|:--|:--|
+| HTTP handling, request validation, chat templates | every layer of the model |
+| Tokenization and detokenization | attention over the KV cache |
+| Scheduling: which requests run this step, KV block allocation | sampling (to avoid shipping logits to the host) |
+| Stop-string checks, streaming responses | KV cache reads and writes |
+| Grammar and JSON-schema state machines (often) | applying the grammar's token mask (often) |
+
+The CPU part is serial, branchy, and small per step: exactly what CPUs are good at. The engineering problem is making sure it **never makes
+the GPU wait**. Engines overlap the CPU's work for step $t+1$ with the GPU's step $t$, and move CPU work off the critical path
+([10.5](/learn/m10/vllm-v1-architecture)).
+
+<Callout type="warning" title="A slow CPU can bottleneck a fast GPU">
+  With a small model and large batches, the GPU step can take only a few milliseconds. If tokenization, scheduling and detokenization for
+  hundreds of requests take longer than that, the GPU idles. Profile the CPU side too ([7.1](/learn/m07/top-down-profiling)).
+</Callout>
+
+## When CPU inference is the right answer
+
+Decode is memory-bound ([3.4](/learn/m03/prefill-vs-decode)), so what matters for single-user generation is memory bandwidth and capacity, not FLOPs:
+
+- A laptop running a **4-bit 7–8B model** on its CPU with llama.cpp reads about 4.5 GB per token. At 50–100 GB/s of memory bandwidth that is
+  roughly 10–20 tokens/s: perfectly usable for one person, with no GPU at all.
+- A server CPU with 12 DDR5 channels (~460 GB/s) and a terabyte of RAM can hold models that don't fit on any single GPU, and decode them at
+  modest speeds.
+- Apple silicon and similar chips share one large memory between CPU and GPU, removing the bus from the picture.
+
+GPUs win decisively when there is **concurrency** (batching many users) or **long prompts** (compute-bound prefill). For one user, a small
+quantized model and a fast memory system, the CPU is often enough.
+
+<Callout type="insight">
+  The question isn't "is a GPU faster?" but "is the work big enough, parallel enough and already in the right place to pay for using one?".
+  The roofline ([3.3](/learn/m03/roofline)) and the bus ([4.3](/learn/m04/host-device-memory)) give you the numbers to answer it.
+</Callout>
+
+<Callout type="note" title="Exercises">
+  1. Using your measured PCIe and CPU bandwidths (labs [2.3](/learn/m02/bandwidth-and-memory-hierarchy) and [4.3](/learn/m04/host-device-memory)), at what vector length does a GPU vector add with data starting and ending on the host break even? Does it ever?
+  2. Sorting 1,000 integers once, sorting 100 M integers once, and applying a regex to 1,000 strings: which would you put on the GPU, and why?
+  3. Estimate decode tokens/s for a 4-bit 8B model on your machine from lab 2.3's DRAM bandwidth. If you have llama.cpp, measure it.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 2: when GPU offload pays, and when it doesn't." />
+  <SourceCard id="CUDA100" note="Days 1–7: the costs of launching and transferring, which set the break-even point." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An elementwise operation on 1 M floats starts and ends in host memory. What usually dominates the GPU version\'s time?',
+      options: ['The kernel', 'The PCIe transfers', 'The launch overhead', 'Shared memory'],
+      answer: 1,
+      explain: 'The kernel takes well under 0.1 ms; moving 12 MB across PCIe takes about a millisecond.',
+    },
+    {
+      q: 'Which of these belongs on the CPU in an inference server?',
+      options: ['Attention over the KV cache', 'The MLP matmuls', 'Request scheduling and detokenization', 'Sampling from logits'],
+      answer: 2,
+      explain: 'Scheduling and string handling are serial and branchy. Sampling usually stays on the GPU to avoid moving logits.',
+    },
+    {
+      q: 'Why can a CPU give usable single-user decode speed for a quantized 8B model?',
+      options: [
+        'CPUs have more FLOPs than GPUs',
+        'Decode is memory-bound, and a 4-bit model needs only a few GB read per token, within a CPU\'s bandwidth budget',
+        'CPUs have tensor cores',
+        'Quantized models need no memory bandwidth',
+      ],
+      answer: 1,
+      explain: 'About 4.5 GB per token at 50–100 GB/s gives roughly 10–20 tokens/s.',
+    },
+    {
+      q: 'What property of a workload most strongly favours the GPU?',
+      options: [
+        'Small size and many branches',
+        'Large, regular, parallel work on data already in GPU memory',
+        'Sequential dependencies',
+        'Heavy file I/O',
+      ],
+      answer: 1,
+      explain: 'That combination fills the GPU\'s lanes, avoids divergence and avoids the bus.',
+    },
+  ]}
+/>

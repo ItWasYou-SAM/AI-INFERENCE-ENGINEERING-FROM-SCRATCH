@@ -1,0 +1,163 @@
+---
+summary: A GPU hides the hundreds of cycles a memory load takes by keeping many warps resident and switching to whichever one is ready. How many warps fit is called occupancy, and it is limited by registers, shared memory and thread count. More is not always better.
+duration: 20 min
+objectives:
+  - Explain how warp schedulers hide memory latency by switching warps
+  - Compute occupancy from threads per block, registers per thread and shared memory per block
+  - Use Little's law to reason about how many bytes must be in flight
+  - Explain why maximum occupancy is not always the goal
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import OccupancyExplorer from '../../../components/viz/OccupancyExplorer.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+A load from HBM takes several hundred cycles ([2.3](/learn/m02/bandwidth-and-memory-hierarchy)). A CPU core would cover that with caches
+and speculation. A GPU does something simpler: it **switches to another warp**.
+
+## Switching costs nothing
+
+Each SM has four **warp schedulers**. Every cycle, each scheduler looks at the warps assigned to it, picks one whose next instruction is
+ready, and issues it. A warp waiting on a load is simply skipped. Because each warp's registers stay in the SM's huge register file the
+whole time, switching takes zero cycles: there is no state to save or restore.
+
+So latency is hidden if, at every cycle, *some* warp has work ready. That depends on two things:
+
+- how many warps the scheduler has to choose from, and
+- how much independent work each warp does between memory waits.
+
+## Occupancy
+
+**Occupancy** is the number of warps resident on an SM, as a fraction of the maximum (64 on an H100). It is capped by whichever resource
+runs out first:
+
+| Resource per SM (H100) | Limit | Used by each block |
+|:--|--:|:--|
+| Warp slots | 64 warps (2,048 threads) | threads per block ÷ 32 |
+| Block slots | 32 blocks | 1 |
+| Registers | 65,536 × 32-bit | registers per thread × threads per block |
+| Shared memory | up to 228 KB | whatever the kernel declares |
+
+A kernel with 256 threads per block that uses 64 registers per thread needs 16,384 registers per block, so only 4 blocks fit: 32 warps, or
+**50%** occupancy, limited by registers.
+
+<Figure label="fig. 2.5" caption="Top: set what one block needs and see how many fit on an SM, and which limit binds. Bottom: one scheduler running its share of those warps. Each warp does some math, then waits on a load.">
+  <OccupancyExplorer client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Start at 256 threads and 64 registers (50%). Drop to 32 registers. Occupancy doubles to 100% and the scheduler gets busier.
+  2. Raise **math between loads** to 40 cycles with occupancy at 50%. The scheduler gets nearly as busy as with twice the warps: more work per warp substitutes for more warps.
+  3. Set shared memory to 100 KB per block. Only 2 blocks fit, and shared memory is now the limit.
+</Callout>
+
+## Little's law: count the bytes in flight
+
+How much has to be in flight to keep HBM busy? **Little's law** says
+
+$$
+\text{bytes in flight} = \text{bandwidth} \times \text{latency}.
+$$
+
+For an H100, $3.35\ \text{TB/s} \times {\sim}300\ \text{ns} \approx 1\ \text{MB}$ across the GPU, or about **7.6 KB per SM** at every moment.
+If each warp has one 128-byte load outstanding, an SM would need about 60 warps to cover that, nearly full occupancy. If each warp has
+eight 16-byte-per-lane loads outstanding (4 KB), two warps are enough.
+
+<Callout type="insight" title="Occupancy is a means, not the goal">
+  What you need is enough **independent memory requests and instructions in flight**. Many warps is one way to get them. Another is
+  **instruction-level parallelism** inside each warp: issue several independent loads before using any of them, use wide vector loads, or
+  use asynchronous copies into shared memory. High-performance GEMM and attention kernels often run at 12–25% occupancy on purpose: they
+  spend registers on big tiles that give each warp lots of reuse ([6.3](/learn/m06/register-pressure-spilling), [6.6](/learn/m06/latency-hiding-ilp)).
+</Callout>
+
+## Lab: an occupancy calculator 🟢
+
+```python title="labs/m02/2.5/occupancy.py"
+limits = {
+    "warps": SM["max_warps"] // warps_per_block,
+    "blocks": SM["max_blocks"],
+    "registers": SM["regs"] // (regs_per_thread * threads_per_block),
+    "shared mem": SM["smem"] // smem_per_block,
+}
+blocks = min(limits.values())
+```
+
+```bash
+python labs/m02/2.5/occupancy.py
+```
+
+```text title="output"
+threads/blk regs/thr  smem/blk  warps   occ.  limited by
+        256       32       0KB     64   100%  warps
+        256       64       0KB     32    50%  registers
+        256      128       0KB     16    25%  registers
+        256      255       0KB      8    12%  registers
+        128       64      48KB     16    25%  shared mem
+        256       64     100KB     16    25%  shared mem
+
+Latency hiding: 20 cycles of math per load, ~500-cycle memory latency
+   1 warps/scheduler -> scheduler busy   3.8%
+   2 warps/scheduler -> scheduler busy   7.7%
+   4 warps/scheduler -> scheduler busy  15.4%
+   8 warps/scheduler -> scheduler busy  30.8%
+  16 warps/scheduler -> scheduler busy  61.5%
+  needed for 100%: ~26 warps/scheduler, but an SM holds at most 16 per scheduler.
+```
+
+The last line is the important one: with only one load in flight per warp, even full occupancy can't hide a 500-cycle latency. Real
+kernels close the gap with more loads in flight per warp.
+
+<Callout type="note" title="Exercises">
+  1. Real hardware allocates registers in chunks (per warp, in multiples of 256). Add that rounding to `occupancy()`. Which rows change?
+  2. A kernel uses 96 registers per thread and 128 threads per block. What is its occupancy, and which limit binds?
+  3. With the model `util = W × C / (C + L)`, how many cycles of math per load does a scheduler with 8 warps need to stay busy at L = 500?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 1: occupancy, warp scheduling and latency hiding." />
+  <SourceCard id="FREGLY" note="Occupancy and ILP chapters: why high occupancy is not always the target." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why can a GPU switch between warps in zero cycles?',
+      options: [
+        'It saves registers to HBM very quickly',
+        'Every resident warp keeps its registers in the SM\'s register file, so there is nothing to save or restore',
+        'Warps share registers',
+        'It cannot; switching takes hundreds of cycles',
+      ],
+      answer: 1,
+      explain: 'All resident warps have their state on-chip at once. The scheduler just picks a different one to issue from.',
+    },
+    {
+      q: 'A block has 512 threads using 64 registers each. How many blocks fit on an H100 SM by registers alone?',
+      options: ['1', '2', '4', '8'],
+      answer: 1,
+      explain: '512 × 64 = 32,768 registers per block; 65,536 ÷ 32,768 = 2 blocks.',
+    },
+    {
+      q: 'Little\'s law says bytes in flight equals…',
+      options: ['bandwidth ÷ latency', 'bandwidth × latency', 'latency ÷ bandwidth', 'FLOPs × bytes'],
+      answer: 1,
+      explain: 'To sustain a bandwidth B with latency L, B × L bytes must be outstanding at all times.',
+    },
+    {
+      q: 'Why do some of the fastest matmul kernels run at low occupancy?',
+      options: [
+        'They are badly written',
+        'They spend registers on large tiles that give each warp a lot of reuse and independent work, which hides latency without many warps',
+        'Low occupancy uses less HBM',
+        'Tensor cores require low occupancy',
+      ],
+      answer: 1,
+      explain: 'Latency is hidden by work in flight, not by warp count as such. Big register tiles trade warps for reuse and ILP.',
+    },
+  ]}
+/>

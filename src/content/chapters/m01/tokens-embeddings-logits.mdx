@@ -1,0 +1,156 @@
+---
+summary: A model never sees text. It sees integer token ids going in and a score for every possible next token coming out. This chapter covers both ends of the model, and the costs that sit there.
+duration: 15 min
+objectives:
+  - Explain what a token is and why BPE tokenizers split text the way they do
+  - Describe an embedding lookup and the residual stream it starts
+  - Turn a final hidden state into logits and probabilities
+  - Estimate the size and per-token cost of the embedding table and LM head
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+An LLM is a function from a list of integers to a list of scores. Text only exists at the edges: a **tokenizer** turns your prompt into
+integers on the way in, and a **detokenizer** turns integers back into text on the way out. Everything in between is matrix math.
+
+$$
+\underbrace{\text{"The cache stores…"}}_{\text{text}} \xrightarrow{\text{tokenize}} [791,\ 6636,\ 10756,\ \dots] \xrightarrow{\text{model}} \underbrace{\text{logits} \in \mathbb{R}^{V}}_{\text{one score per vocab entry}}
+$$
+
+## Tokens
+
+A **token** is a chunk of text from a fixed vocabulary of size $V$. Most modern models use **byte-pair encoding (BPE)**:
+
+1. Start with the 256 possible bytes as the vocabulary.
+2. Count every adjacent pair of tokens in a large training corpus.
+3. Merge the most frequent pair into a new token. Repeat until the vocabulary reaches the target size.
+
+Frequent words end up as a single token (`" the"`), and rare words get split into pieces (`"Paged" + "Attention"`). In English a
+token averages about **4 characters**, or about ¾ of a word. Code, other languages and numbers usually need more tokens per character.
+
+<Callout type="insight" title="Why inference engineers care">
+  The token is the unit of everything you will measure: price is per million tokens, latency is time-to-first-*token* and time-per-output-*token*,
+  and memory is KV cache per *token*. A tokenizer that needs 30% more tokens for the same text costs 30% more on every one of those axes.
+</Callout>
+
+Tokenization runs on the CPU, before the GPU is involved. It is cheap, but it is not free: on a busy server, a slow Python tokenizer can
+become the bottleneck for short requests. Production engines use fast Rust tokenizers and run them off the main scheduling loop.
+
+## Embeddings
+
+Each token id selects one row of the **embedding table** $E \in \mathbb{R}^{V \times d}$, where $d$ is the model width (`d_model`):
+
+$$
+x_t = E[\text{id}_t] \qquad x \in \mathbb{R}^{T \times d}
+$$
+
+That is a **gather**, not a matmul: no multiplications happen, the GPU just copies $T$ rows. The result is the **residual stream**,
+one $d$-dimensional vector per token. Every layer reads it and adds its contribution back onto it ([1.2](/learn/m01/inside-a-transformer-layer)).
+
+## Logits
+
+After the last layer, the model takes the final hidden vector $h$ of a position and scores every token in the vocabulary against it,
+using the **LM head** (also called the unembedding) $W_U \in \mathbb{R}^{d \times V}$:
+
+$$
+z = h\,W_U \in \mathbb{R}^{V} \qquad p_i = \operatorname{softmax}(z)_i = \frac{e^{z_i}}{\sum_j e^{z_j}}
+$$
+
+The raw scores $z$ are the **logits**. Softmax turns them into a probability distribution over the next token. Some models reuse the
+embedding table as the LM head (**tied** embeddings, $W_U = E^\top$), which saves a $V \times d$ matrix.
+
+<Callout type="note" title="Only the last position matters at inference">
+  The model produces logits for every input position, but when generating you only need the last one. Engines slice the final hidden
+  state down to the last token *before* the LM head, which saves a $T \times d \times V$ matmul during prefill.
+</Callout>
+
+## What the two ends cost
+
+The vocabulary used to be 32K tokens. Newer models use 128K–152K, which makes the edges of the model expensive:
+
+| Model | $V$ | $d$ | One table in BF16 | LM head FLOPs per token |
+|:--|--:|--:|--:|--:|
+| Llama-2-7B | 32,000 | 4,096 | 262 MB | 0.26 GFLOP |
+| Llama-3-8B | 128,256 | 4,096 | 1,051 MB | 1.05 GFLOP |
+| Qwen2.5-7B | 152,064 | 3,584 | 1,090 MB | 1.09 GFLOP |
+
+For Llama-3-8B, the LM head alone is about **7%** of the roughly 15 GFLOP it takes to produce one token, and it has to read a full gigabyte
+of weights every decode step. On a small model the share is much larger: in Qwen2.5-0.5B, the embedding table is over a quarter of all parameters.
+
+## Lab: train a tokenizer and score the vocabulary 🟢
+
+```python title="labs/m01/1.1/tokens.py"
+pairs = Counter(zip(ids, ids[1:]))
+(a, b), count = pairs.most_common(1)[0]   # most frequent adjacent pair
+vocab[new_id] = vocab[a] + vocab[b]        # ...becomes one new token
+```
+
+```bash
+python labs/m01/1.1/tokens.py
+```
+
+```text title="output (excerpt)"
+first merges (most frequent pair becomes a new token):
+      b'h' + b'e'     -> id 256 b'he'  (seen 12x)
+      b't' + b'he'    -> id 257 b'the'  (seen 9x)
+      b' ' + b'the'   -> id 258 b' the'  (seen 8x)
+after 20 merges: 71 tokens for 144 bytes (2.03 bytes/token)
+
+Real models: embedding table = vocab x d_model x 2 bytes (BF16)
+  Llama-3-8B   128256 x 4096 ->   1051 MB (and the same again for the LM head if untied)
+```
+
+<Callout type="note" title="Exercises">
+  1. Raise `n_merges` to 60. How do bytes per token change, and why does it level off on such a short text?
+  2. Add a sentence in another language to `TEXT`. How many tokens does it need compared with English?
+  3. Install `tiktoken` or `transformers` and count the tokens of the same paragraph with a real tokenizer.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="MOHITH" note="The inference pipeline: from tokens through the layers to logits." />
+  <SourceCard id="CUDA100" note="Days 14, 28 and 31 implement these operations as CUDA kernels; you will revisit them in Module 8." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In a BPE tokenizer, how does a new token get added to the vocabulary?',
+      options: [
+        'A linguist marks common words',
+        'The most frequent adjacent pair of existing tokens is merged into one',
+        'Every English word gets its own token',
+        'Tokens are chosen at random from the training set',
+      ],
+      answer: 1,
+      explain: 'BPE starts from bytes and repeatedly merges the most frequent adjacent pair until the vocabulary reaches its target size.',
+    },
+    {
+      q: 'What operation does an embedding lookup perform on the GPU?',
+      options: ['A d×V matmul', 'A softmax', 'A gather: copy one row per token id', 'A convolution'],
+      answer: 2,
+      explain: 'Each token id indexes one row of the embedding table. No multiplications are needed.',
+    },
+    {
+      q: 'Llama-3-8B has V = 128,256 and d = 4,096. Roughly how many FLOPs does its LM head cost per generated token?',
+      options: ['1 MFLOP', '1 GFLOP', '1 TFLOP', 'Zero, it is a lookup'],
+      answer: 1,
+      explain: '2 × 4096 × 128,256 ≈ 1.05 GFLOP: one multiply and one add per weight.',
+    },
+    {
+      q: 'Why do engines slice the hidden states to the last position before the LM head during prefill?',
+      options: [
+        'The other positions have invalid values',
+        'Only the last position\'s logits are needed to pick the next token, so the rest would be wasted work',
+        'Softmax only works on one row',
+        'To make the KV cache smaller',
+      ],
+      answer: 1,
+      explain: 'Generation only samples from the last position. Computing logits for every prompt token would cost T × d × V extra FLOPs for nothing.',
+    },
+  ]}
+/>

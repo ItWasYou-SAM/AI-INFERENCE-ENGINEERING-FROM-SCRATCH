@@ -1,0 +1,186 @@
+---
+summary: Put the whole module to work on one model. Count every FLOP and byte in a Llama-2-7B forward step, place each operation on an H100 roofline, and predict decode and prefill speed before touching a GPU.
+duration: 30 min
+objectives:
+  - Count FLOPs and HBM bytes for every operation in a transformer step
+  - Compute each operation's arithmetic intensity and roofline time
+  - Predict single-user decode speed, batched throughput and prefill time
+  - Find which operation dominates each scenario, and what would change it
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+This is the deliverable of the first week of the time-to-first-token course, done in code: a full accounting of one forward step of a 7B
+model. Do the first table by hand before running the lab, then use the script to check yourself.
+
+## The model
+
+Llama-2-7B, BF16 (2 bytes per value):
+
+| $L$ layers | $d$ | heads | KV heads | $d_h$ | $d_{ff}$ | vocab |
+|--:|--:|--:|--:|--:|--:|--:|
+| 32 | 4,096 | 32 | 32 | 128 | 11,008 | 32,000 |
+
+Target hardware: H100 SXM, 989 TFLOP/s and 3.35 TB/s, so the ridge is **295 FLOP/byte** ([3.3](/learn/m03/roofline)).
+
+## The accounting
+
+For a step that processes $M$ tokens (the batch size in decode, the prompt length in prefill), per layer:
+
+| Op | FLOPs | Bytes (BF16) |
+|:--|:--|:--|
+| QKV projection | $2M \cdot d \cdot 3d$ | $2\,(3d^2 + Md + 3Md)$ |
+| Output projection | $2M d^2$ | $2\,(d^2 + 2Md)$ |
+| MLP gate + up | $2M \cdot d \cdot 2d_{ff}$ | $2\,(2 d\, d_{ff} + Md + 2M d_{ff})$ |
+| MLP down | $2M \cdot d_{ff} \cdot d$ | $2\,(d_{ff}\, d + M d_{ff} + Md)$ |
+| Attention, decode, context $n$ | $b \cdot 4 n d$ | $b \cdot 2 \cdot 2 n d$ (read K and V) |
+
+Then multiply by $L$ and add the LM head, $2 b d V$ FLOPs over $2dV$ bytes of weights. Each op's roofline time is
+$\max(F / P,\; Q / B)$, and the step's time is the sum.
+
+```python title="labs/m03/3.5/derive_ai_7b.py"
+def matmul(m, k, n):
+    return 2 * m * k * n, B * (m * k + k * n + m * n)    # FLOPs, bytes
+
+ops = {
+    "QKV proj":    matmul(M, D, D + 2 * kvd),
+    "O proj":      matmul(M, D, D),
+    "MLP gate+up": matmul(M, D, 2 * FF),
+    "MLP down":    matmul(M, FF, D),
+}
+t = max(flops / PEAK, bytes / BW)                       # per op, then summed
+```
+
+```bash
+python labs/m03/3.5/derive_ai_7b.py
+```
+
+## Scenario 1: one user, decode
+
+```text title="output"
+DECODE  batch 1, context 1024
+op                GFLOP  GB moved   FLOP/B  time (us)  bound
+QKV proj            3.2      3.22      1.0        962  memory
+O proj              1.1      1.07      1.0        321  memory
+MLP gate+up         5.8      5.77      1.0       1723  memory
+MLP down            2.9      2.89      1.0        862  memory
+attention           0.5      0.54      1.0        160  memory
+LM head             0.3      0.26      1.0         78  memory
+total              13.8     13.76      1.0       4106
+-> step 4.11 ms at the roofline; 244 tokens/s (per-user 244 tok/s)
+```
+
+Every operation has intensity **1.0**: every byte loaded is used for exactly one multiply-add. The step is simply "read 13.8 GB at 3.35 TB/s".
+The tensor cores are busy for about **0.3%** of it. The MLP accounts for 63% of the time because it holds most of the weights ([1.2](/learn/m01/inside-a-transformer-layer)).
+
+## Scenario 2: 64 users, decode
+
+```text title="output"
+DECODE  batch 64, context 1024
+op                GFLOP  GB moved   FLOP/B  time (us)  bound
+QKV proj          206.2      3.29     62.7        982  memory
+O proj             68.7      1.11     62.1        331  memory
+MLP gate+up       369.4      5.88     62.8       1755  memory
+MLP down          184.7      2.95     62.7        880  memory
+attention          34.4     34.39      1.0      10267  memory
+LM head            16.8      0.27     62.9         80  memory
+total             880.1     47.88     18.4      14293
+-> step 14.29 ms at the roofline; 4,478 tokens/s (per-user 70 tok/s)
+```
+
+Three things happened:
+
+1. The weight matmuls went from intensity 1 to about **63** and take about the same time as before: 64 times the work for free.
+   They are still memory-bound, since the ridge is 295.
+2. **Attention became 72% of the step.** Each of the 64 users brings 0.5 GB of KV cache, and attention's intensity stays at 1.
+3. Throughput rose 18×, from 244 to 4,478 tokens/s, while each user's speed fell from 244 to 70 tokens/s.
+
+<Callout type="insight" title="The KV cache is the next bottleneck">
+  Once batching makes the weights cheap, the KV cache dominates. Everything in [Module 9](/learn/m09/kv-cache-size) attacks exactly this line
+  of the table: grouped-query attention shrinks it 4–8×, FP8 KV halves it, and paging lets more users fit.
+</Callout>
+
+## Scenario 3: prefill
+
+```text title="output"
+PREFILL one 2048-token prompt
+op                GFLOP  GB moved   FLOP/B  time (us)  bound
+QKV proj         6597.1      5.37   1228.8       6670  compute
+O proj           2199.0      2.15   1024.0       2223  compute
+MLP gate+up     11819.7      9.19   1285.6      11951  compute
+MLP down         5909.9      4.87   1214.7       5976  compute
+attention        1099.5      2.15    512.0       1112  compute
+LM head             0.3      0.26      1.0         78  memory
+total           27625.5     23.99   1151.8      28011
+-> step 28.01 ms at the roofline; 73,115 tokens/s (prefill)
+```
+
+Now everything except the LM head (which only runs for the last position) is far above the ridge. Prefill processes 73K tokens/s, about
+300 times the single-user decode rate, with the *same* weights and the *same* GPU. TTFT for this prompt is at least 28 ms.
+
+<Callout type="warning" title="These are lower bounds">
+  The roofline assumes each kernel hits its ceiling exactly. Real kernels typically reach 60–85% of peak bandwidth or compute, and there
+  is launch overhead between them ([3.1](/learn/m03/compute-vs-memory-bound)). Expect real numbers 1.2–2× slower. The *shape* (which op
+  dominates, and which ceiling it hits) is what transfers to real systems. In [Module 13](/learn/m13/serving-metrics) you will measure the gap.
+</Callout>
+
+## Exercises
+
+<Callout type="note" title="Exercises">
+  1. **Grouped-query attention.** Set `KV = 8` (as in Llama-3-8B, ignoring its larger MLP and vocabulary). Rerun the batch-64 scenario. How much does attention shrink, and what is the new throughput?
+  2. **FP8 weights.** Make the weight bytes 1 per value while keeping activations and KV in BF16. Which scenario speeds up, and by how much?
+  3. **Find the ridge.** Raise the decode batch until the MLP matmuls become compute-bound. What batch is that, and could the KV cache for that many users fit in 80 GB at context 1024?
+  4. **Long context.** Set the context to 8,192 at batch 16. What fraction of the step is attention now?
+  5. **Check against reality.** If you have a GPU, serve Llama-2-7B with vLLM and measure TPOT at batch 1 ([0.2 lab](/learn/m00/life-of-a-request)). How close to 4.1 ms do you get?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="TTFT" note="Week 1 deliverable: derive the arithmetic intensity of a 7B model by hand." />
+  <SourceCard id="MOHITH" note="Model shapes, KV size and the memory-bound decode argument this lab quantifies." />
+  <SourceCard id="BGE" note="Ch 33–35: the two ceilings applied per operation." />
+  <SourceCard id="FREGLY" note="The arithmetic-intensity chapter: per-operation accounting for transformer layers." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'At batch 1, what is the arithmetic intensity of every weight matmul in BF16?',
+      options: ['About 0.5', 'About 1', 'About 64', 'About 295'],
+      answer: 1,
+      explain: 'Each 2-byte weight is used for one multiply-add (2 FLOPs): 2 FLOPs / 2 bytes = 1.',
+    },
+    {
+      q: 'In the batch-64 decode scenario for Llama-2-7B, which operation dominates step time?',
+      options: ['The MLP', 'The QKV projection', 'Attention over the KV cache', 'The LM head'],
+      answer: 2,
+      explain: 'Weight reads are shared across the batch, but every user brings 0.5 GB of KV cache that must be read at intensity 1.',
+    },
+    {
+      q: 'Why does the LM head stay memory-bound even during prefill?',
+      options: [
+        'It uses INT8',
+        'Only the last position of each sequence needs logits, so it multiplies the weights by just one row',
+        'It runs on the CPU',
+        'The vocabulary is too small',
+      ],
+      answer: 1,
+      explain: 'With M = 1 per sequence, the LM head is a GEMV with intensity ≈ 1, whatever the prompt length.',
+    },
+    {
+      q: 'Why are the lab\'s times lower bounds, not predictions?',
+      options: [
+        'The FLOP counts are wrong',
+        'Real kernels reach only part of peak, and there is overhead between kernels',
+        'H100s are faster than their datasheet',
+        'Attention is not counted',
+      ],
+      answer: 1,
+      explain: 'The roofline gives the best possible time. Real kernels land at maybe 60–85% of the relevant ceiling.',
+    },
+  ]}
+/>

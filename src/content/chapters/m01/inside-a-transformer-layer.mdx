@@ -1,0 +1,136 @@
+---
+summary: A decoder-only LLM is one layer design repeated 24 to 80 times. Learn its blocks once, and you can work out a model's parameter count, its FLOPs per token, and which parts of it are expensive to run.
+duration: 20 min
+objectives:
+  - Name the blocks of a pre-norm decoder layer and the order data flows through them
+  - Explain the residual stream and why layers add rather than overwrite
+  - Count a layer's parameters from its config and split them between attention and MLP
+  - Use the 2N rule to estimate FLOPs per token
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import TransformerLayer from '../../../components/viz/TransformerLayer.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+After the embedding lookup ([1.1](/learn/m01/tokens-embeddings-logits)), the residual stream $x \in \mathbb{R}^{T \times d}$ passes
+through $L$ identical layers. Each layer has two sub-blocks, and each sub-block reads the stream, computes something, and **adds** it back:
+
+$$
+\begin{aligned}
+x &\leftarrow x + \operatorname{Attention}(\operatorname{RMSNorm}(x)) \\
+x &\leftarrow x + \operatorname{MLP}(\operatorname{RMSNorm}(x))
+\end{aligned}
+$$
+
+That is the whole layer. Llama, Qwen, Mistral and most other open models use exactly this shape, with small variations.
+
+## The blocks
+
+<Figure label="fig. 1.2" caption="One layer of a Llama-style decoder, in data-flow order. Click a block to see its shape, parameters and FLOPs per token. Bar width shows each block's share of the layer's parameters.">
+  <TransformerLayer client:visible />
+</Figure>
+
+- **RMSNorm** rescales each token's vector to unit root-mean-square, then multiplies by a learned gain. It keeps activations in a
+  numerically safe range. It is called *pre-norm* because it is applied before each sub-block, not after.
+- **Attention** is the only place where tokens exchange information. It gets its own chapter ([1.3](/learn/m01/attention-step-by-step)).
+  Around it sit four weight matrices: $W_Q, W_K, W_V$ in, $W_O$ out.
+- **The MLP** works on each token independently. Modern models use **SwiGLU**: two parallel projections up to a wider dimension
+  $d_{ff}$, a gated nonlinearity, and a projection back down.
+
+$$
+\operatorname{MLP}(h) = \big(\operatorname{SiLU}(h W_{\text{gate}}) \odot h W_{\text{up}}\big)\, W_{\text{down}}
+$$
+
+<Callout type="insight" title="The residual stream is a shared bus">
+  Layers never replace $x$; they only add to it. Think of the stream as a bus that every layer reads from and writes back to. For
+  inference this has a practical side: the stream is the activation that has to move between GPUs when a model is split across them
+  ([Module 14](/learn/m14/tensor-parallelism)).
+</Callout>
+
+## Counting parameters
+
+For a layer with width $d$, MLP width $d_{ff}$, $n_h$ query heads and $n_{kv}$ key/value heads of size $d_h = d / n_h$:
+
+$$
+\underbrace{d^2}_{W_Q} + \underbrace{2\,d\,n_{kv} d_h}_{W_K,\,W_V} + \underbrace{d^2}_{W_O} + \underbrace{3\,d\,d_{ff}}_{\text{MLP}} + \underbrace{2d}_{\text{norms}}
+$$
+
+Plug in **Llama-3-8B** ($d = 4096$, $d_{ff} = 14336$, $n_h = 32$, $n_{kv} = 8$):
+
+| Part | Parameters per layer |
+|:--|--:|
+| $W_Q$ + $W_O$ | 33.6 M |
+| $W_K$ + $W_V$ (8 KV heads) | 8.4 M |
+| MLP (gate, up, down) | 176.2 M |
+| **Layer total** | **218.1 M** |
+
+Multiply by 32 layers to get 6.98 B, then add the untied embedding table and LM head (2 × 525 M) for **8.03 B** in total. The MLP holds
+about **80%** of each layer's weights.
+
+## FLOPs per token: the 2N rule
+
+Every weight in a matmul takes part in one multiply and one add for each token that passes through. So a forward pass costs about
+
+$$
+\text{FLOPs per token} \approx 2N
+$$
+
+where $N$ is the number of parameters used in matmuls (the embedding lookup is free). For Llama-3-8B that is about **15 GFLOP per
+token**, plus the attention-over-context term, which grows with sequence length and is small at short contexts.
+
+<Callout type="warning" title="FLOPs are not the bottleneck during decode">
+  15 GFLOP is nothing for an H100 that does about 989 TFLOP/s: it would take 15 microseconds. Generating one token actually takes about
+  5 milliseconds, because every one of those 8 B weights (16 GB in BF16) has to be read from memory each step. Chapter
+  [3.3](/learn/m03/roofline) turns this gap into a picture.
+</Callout>
+
+<Callout type="try" title="Try these">
+  1. Switch to **Qwen2.5-0.5B**. The layers are small, but look at the embedding count under the figure: a 152K vocabulary is a large part of a small model.
+  2. Click **Q, K, V projections** for Llama-3-8B and Llama-3-70B. Both have 8 KV heads, so K and V are much narrower than Q. That is
+     grouped-query attention, and it shrinks the KV cache ([9.2](/learn/m09/mqa-gqa-mla)).
+  3. Compare the attention/MLP split across the three models. Does it change much as models grow?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="MOHITH" note="Inside a layer: attention, MLP and why the per-token cost is about 2N FLOPs." />
+  <SourceCard id="CUDA100" note="Days 14, 28 and 31: the norm, activation and matmul kernels behind these blocks." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'In a pre-norm decoder layer, what happens to the residual stream x?',
+      options: [
+        'Each sub-block overwrites it with its output',
+        'Each sub-block adds its output to it',
+        'It is only used by the first layer',
+        'It is normalized and then discarded',
+      ],
+      answer: 1,
+      explain: 'x ← x + Attention(norm(x)), then x ← x + MLP(norm(x)). Layers only add to the stream.',
+    },
+    {
+      q: 'Which block is the only one where tokens exchange information with each other?',
+      options: ['RMSNorm', 'The MLP', 'Attention', 'The residual add'],
+      answer: 2,
+      explain: 'Norms, MLPs and residual adds all work on each token independently. Attention mixes information across positions.',
+    },
+    {
+      q: 'Roughly how many FLOPs does a 70B-parameter model need per generated token, ignoring attention over the context?',
+      options: ['70 GFLOP', '140 GFLOP', '1.4 TFLOP', '70 TFLOP'],
+      answer: 1,
+      explain: 'About 2N: one multiply and one add per weight, so 2 × 70e9 = 140 GFLOP.',
+    },
+    {
+      q: 'In Llama-3-8B, where do most of a layer\'s parameters live?',
+      options: ['The attention projections', 'The MLP', 'The norms', 'The KV cache'],
+      answer: 1,
+      explain: 'About 176 M of 218 M parameters per layer are in the SwiGLU MLP. The KV cache is activations, not parameters.',
+    },
+  ]}
+/>

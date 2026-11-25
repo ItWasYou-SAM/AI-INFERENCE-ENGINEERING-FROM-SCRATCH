@@ -1,0 +1,170 @@
+---
+summary: Without a cache, generating token n means recomputing all n tokens before it. The KV cache stores each token's keys and values once, which makes every decode step cost one token of compute, and turns memory into the resource that limits a serving engine.
+duration: 20 min
+objectives:
+  - Explain why recomputing the full sequence each step wastes work
+  - Say exactly what the KV cache stores, and why Q and other activations are not cached
+  - Compute the KV cache size per token from a model config
+  - Describe the compute-for-memory trade the cache makes
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import KVCacheCompare from '../../../components/viz/KVCacheCompare.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+The loop in [1.4](/learn/m01/autoregressive-generation) calls `model(tokens)` on the *whole* sequence every step. At step 500 it pushes
+500 tokens through every layer to learn one new thing: the logits of the last position. The other 499 positions produce exactly the same
+results they produced on the previous step.
+
+## The waste, and the fix
+
+Chapter [1.3](/learn/m01/attention-step-by-step) ended with the key fact: because of the causal mask, **adding a token never changes anything
+computed for earlier tokens**. The only thing a new token needs from the past is, in every layer, the keys and values of all earlier positions.
+
+So store them. After computing $k_t$ and $v_t$ for a token in each layer, append them to a per-layer buffer. On the next step, run only the
+newest token through the model, and let its query attend over the stored keys and values:
+
+$$
+\underbrace{q_{n}}_{\text{new}} \cdot \big[\,\underbrace{k_0, \dots, k_{n-1}}_{\text{from cache}},\ \underbrace{k_n}_{\text{new}}\,\big]^\top
+\quad\Longrightarrow\quad \text{weights} \cdot \big[\,v_0, \dots, v_{n-1},\ v_n\,\big]
+$$
+
+<Figure label="fig. 1.5" caption="Generating 9 tokens after a 5-token prompt. Top: the uncached loop pushes every position through the model on every step. Bottom: with a KV cache, prefill fills the cache once, then each step computes one new row.">
+  <KVCacheCompare client:visible />
+</Figure>
+
+This is what turns generation into the two phases you met in [0.2](/learn/m00/life-of-a-request): **prefill** computes K and V for the whole
+prompt and fills the cache, and each **decode** step adds one row.
+
+<Callout type="note" title="Why only K and V?">
+  - The **query** is only ever used by its own token, in the step it is created. No later token reads it, so there is nothing to reuse.
+  - The **hidden states** of earlier tokens also never change, but later tokens never read them directly. Later tokens read the past only
+    through attention, and attention only needs K and V.
+  - The **attention output** of an earlier token is already folded into its residual stream, which feeds that token's K and V in the next
+    layer. Caching K and V in every layer captures everything the future needs.
+</Callout>
+
+## What it saves
+
+For a 7B model, the work to produce the token after a context of length $n$ (from the lab below):
+
+| Context $n$ | No cache | With KV cache | Ratio |
+|--:|--:|--:|--:|
+| 128 | 1.70 TFLOP | 13.3 GFLOP | 128× |
+| 2,048 | 29.3 TFLOP | 14.3 GFLOP | 2,048× |
+| 32,768 | 996 TFLOP | 30.4 GFLOP | 32,768× |
+
+The ratio is exactly $n$: without a cache, you redo the work for all $n$ positions to get one new one. Over a whole generation, total work
+goes from quadratic in length to linear.
+
+## What it costs
+
+The cache is not free. Every token in every active request keeps its keys and values in GPU memory:
+
+$$
+\text{KV bytes per token} = 2 \times L \times n_{kv} \times d_h \times \text{bytes per value}
+$$
+
+The 2 is for K and V. For Llama-2-7B ($L = 32$, $n_{kv} = 32$, $d_h = 128$, BF16), that is **0.5 MiB per token**. A single 4,096-token
+conversation holds 2 GiB of cache, and 32 such conversations would need 64 GiB, more than the model's own 13 GB of weights.
+
+<Callout type="insight" title="The trade that shapes the rest of the course">
+  The KV cache trades FLOPs for bytes. It makes decode cheap in compute, and in exchange makes it **memory-bound** twice over: each step reads
+  all the weights *and* every cached key and value for every request in the batch. From here on, the question is less "how many FLOPs?" and
+  more "how many bytes, and where do they live?". Grouped-query attention, paged memory, quantized caches and prefix sharing all exist to
+  shrink or reuse these bytes ([Module 9](/learn/m09/kv-cache-size)).
+</Callout>
+
+<Callout type="try" title="Try these">
+  1. Press **Play** and watch the counters. After 9 decode steps the uncached loop has done about 7× the row computations, and the gap keeps widening.
+  2. Step to the end and compare the two grids. The cached version computed each cell exactly once; that is the best possible.
+  3. Notice that step 0 (prefill) costs the same in both rows. The cache speeds up decode, not prefill.
+</Callout>
+
+## Lab: count the FLOPs and bytes 🟢
+
+```python title="labs/m01/1.5/kv_flops.py"
+def flops_no_cache(n):   # re-run all n tokens
+    return n * WEIGHT_FLOPS_PER_TOKEN + L * 2 * (2 * n * n * D)
+
+def flops_with_cache(n): # run only the newest token
+    return WEIGHT_FLOPS_PER_TOKEN + L * 2 * (2 * n * D)
+
+def kv_bytes(n):
+    return 2 * L * n * D * BYTES
+```
+
+```bash
+python labs/m01/1.5/kv_flops.py
+```
+
+```text title="output"
+Llama-2-7B: 32 layers, d_model 4096  ->  13.2 GFLOP of weight math per token
+
+ context n        no cache      KV cache    ratio   KV memory
+       128      1.70 TFLOP     13.3 GFLOP     128x     0.06 GiB
+       512      6.90 TFLOP     13.5 GFLOP     512x     0.25 GiB
+      2048     29.26 TFLOP     14.3 GFLOP    2048x     1.00 GiB
+      8192    143.43 TFLOP     17.5 GFLOP    8192x     4.00 GiB
+     32768    995.95 TFLOP     30.4 GFLOP   32768x    16.00 GiB
+
+Generating 2,048 tokens from scratch: 29.2 PFLOP without a cache, 0.028 PFLOP with one.
+Per-token KV cost: 0.50 MiB. That trade, FLOPs for bytes, is what the rest of this course manages.
+```
+
+To see the cache work in real code, run the full model in [1.6](/learn/m01/tiny-gpt-numpy).
+
+<Callout type="note" title="Exercises">
+  1. Change the model to Llama-3-8B: `n_kv = 8` instead of 32 (grouped-query attention). What is the KV cost per token now?
+  2. At what context length does attention's share of decode FLOPs reach 50% for Llama-2-7B?
+  3. An 80 GB GPU holds the 13 GB of weights. How many tokens of KV cache fit in the rest? Chapter [9.1](/learn/m09/kv-cache-size) has a calculator to check your answer.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="MOHITH" note="The KV cache, its size per token, and why memory becomes the serving bottleneck." />
+  <SourceCard id="CUDA100" note="KV-cache kernels appear later in the series; Module 9 works through them." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'What property of attention makes the KV cache possible?',
+      options: [
+        'Softmax is cheap',
+        'The causal mask: a new token never changes the keys and values of earlier tokens',
+        'All heads share the same weights',
+        'The MLP is applied per token',
+      ],
+      answer: 1,
+      explain: 'Earlier positions never depend on later ones, so their K and V can be computed once and reused for every later step.',
+    },
+    {
+      q: 'Why is the query not cached?',
+      options: [
+        'It is too large',
+        'Only its own token uses it, in the step it is computed',
+        'It changes every step',
+        'It is recomputed from V',
+      ],
+      answer: 1,
+      explain: 'Later tokens use their own queries against past keys. A past query is never read again.',
+    },
+    {
+      q: 'A model has 40 layers, 8 KV heads of size 128, and stores the cache in BF16. How many bytes of KV cache per token?',
+      options: ['40 KiB', '80 KiB', '160 KiB', '1.25 MiB'],
+      answer: 2,
+      explain: '2 × 40 × 8 × 128 × 2 bytes = 163,840 bytes = 160 KiB.',
+    },
+    {
+      q: 'Which phase does the KV cache speed up?',
+      options: ['Prefill only', 'Decode only', 'Both equally', 'Neither; it only saves memory'],
+      answer: 1,
+      explain: 'Prefill has to process every prompt token once either way. The cache removes the recomputation on each decode step.',
+    },
+  ]}
+/>

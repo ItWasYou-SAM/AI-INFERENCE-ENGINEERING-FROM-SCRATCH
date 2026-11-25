@@ -1,0 +1,141 @@
+---
+summary: A GPU's memory is a ladder, from tiny, fast registers down to large, slow HBM and slower host memory. Fast kernels keep data on the top rungs and reuse it. LLM decode can't, because it has to stream every weight from the bottom of the ladder on every step.
+duration: 20 min
+objectives:
+  - Name the levels of the GPU memory hierarchy with their rough capacity, latency and bandwidth
+  - Distinguish bandwidth from latency, and say which one limits a streaming workload
+  - Explain why moving data costs more energy than computing on it
+  - Measure your own machine's memory bandwidth and compare it with HBM
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import MemoryHierarchy from '../../../components/viz/MemoryHierarchy.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Memory can be big, fast or cheap, and you can only pick two. Every computer resolves this the same way: a **hierarchy** of small fast
+memories close to the arithmetic, backed by larger slower ones further away.
+
+## Two numbers per level
+
+- **Latency**: how long one request takes to come back. Measured in cycles or nanoseconds.
+- **Bandwidth**: how many bytes per second arrive once many requests are in flight. Measured in GB/s or TB/s.
+
+They are different things. A motorway can have a long trip time and still move many cars per hour. For streaming a large weight matrix,
+**bandwidth** decides the time, as long as enough requests are in flight to cover the latency ([2.5](/learn/m02/occupancy-latency-hiding)).
+
+## The ladder
+
+<Figure label="fig. 2.3" caption="The H100 memory hierarchy. Pick a working set, or drag the slider, to see which level can hold it and how long one full read takes from there. Turn on human scale to feel the latencies.">
+  <MemoryHierarchy client:visible />
+</Figure>
+
+From the top:
+
+- **Registers** are private to each thread and readable every cycle. Each SM has 256 KB of them, which sounds like a lot until you divide it
+  among 2,048 threads.
+- **Shared memory / L1** is a scratchpad (up to 228 KB per SM) that the threads of one block share. Kernels load a tile from HBM into shared
+  memory once and then reuse it many times ([4.4](/learn/m04/shared-memory-syncthreads), [6.1](/learn/m06/tiled-matmul)).
+- **L2** is a 50 MB cache shared by all SMs. It catches reuse across blocks.
+- **HBM** is the GPU's main memory: 80 GB at 3.35 TB/s. Weights and the KV cache live here.
+- **Host DRAM** sits across the PCIe bus at about 64 GB/s, 50 times slower than HBM. Engines use it to offload KV cache that doesn't fit,
+  and pay for it in latency.
+
+<Callout type="try" title="Try these">
+  1. Select **all 8B weights**. One read from HBM takes about 4.8 ms. During those 4.8 ms the tensor cores could have done ~4.7 TFLOP of math.
+  2. Select **one 8B layer**. It does not fit in L2, so every layer's weights stream from HBM.
+  3. Select **70B weights**. They don't fit in one GPU's HBM at all, which is one reason for multi-GPU serving ([Module 14](/learn/m14/tensor-parallelism)).
+  4. Turn on **human scale**. If a register read took one second, an HBM read would take about ten minutes.
+</Callout>
+
+## Moving data costs more than computing
+
+Every byte moved also costs energy. Measurements on a 45 nm process (Horowitz, ISSCC 2014) put a 32-bit floating-point multiply at about
+**4 pJ** and a 32-bit read from off-chip DRAM at about **640 pJ**, over a hundred times more. The ratio has stayed large on newer processes.
+Arithmetic is cheap; getting operands to the arithmetic is the expensive part, both in time and in power.
+
+<Callout type="insight">
+  A fast kernel is one that **reuses** data while it is on the upper rungs. A matmul with a large batch loads each weight once and uses it
+  for every token in the batch. Decode at batch 1 loads each weight and uses it exactly once. That one fact is the root of the roofline
+  picture in [3.3](/learn/m03/roofline).
+</Callout>
+
+## Lab: measure your own bandwidth 🟢
+
+The lab copies arrays of growing size and reports GB/s. Small arrays stay in your CPU's caches; large ones come from DRAM.
+
+```python title="labs/m02/2.3/bandwidth.py"
+for _ in range(reps):
+    np.copyto(dst, src)                       # read src, write dst
+gbps = 2 * n_bytes / best_time / 1e9
+```
+
+```bash
+python labs/m02/2.3/bandwidth.py
+```
+
+```text title="output (one laptop, single thread)"
+ working set     GB/s
+      16 KiB     42.8  ##########
+     128 KiB     45.0  ###########
+       1 MiB     25.4  ######
+       8 MiB     30.4  #######
+      32 MiB     23.9  #####
+     256 MiB     23.7  #####
+    1024 MiB     23.7  #####
+
+DRAM bandwidth here: ~24 GB/s.  An H100's HBM: ~3,350 GB/s (~142x).
+Time to read 16 GB of 8B-model weights once: this machine ~0.68 s, H100 ~4.8 ms.
+```
+
+Your numbers will differ. The shape is what matters: a step down once the working set no longer fits in cache, and a DRAM plateau far
+below HBM. That plateau is why running an 8B model on a laptop CPU gives about one or two tokens per second.
+
+<Callout type="note" title="Exercises">
+  1. Use the measured DRAM number to predict tokens per second for a 4-bit 8B model (about 4.5 GB) on your machine. Then try it with `llama.cpp` if you have it.
+  2. Little's law says bytes in flight = bandwidth × latency. With 3.35 TB/s and ~300 ns latency, how many bytes must an H100 have in flight to reach full bandwidth?
+  3. Why is the 1 MiB result in the output lower than the 8 MiB one? (Hint: caches are not perfectly predictable; rerun a few times.)
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 1: memory bandwidth, the hierarchy, and why data movement dominates." />
+  <SourceCard id="FREGLY" note="GPU architecture chapters: registers, shared memory, L2 and HBM on Hopper." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Which number decides how long it takes to stream a 16 GB weight file, once enough loads are in flight?',
+      options: ['Latency', 'Bandwidth', 'Clock speed', 'Number of SMs'],
+      answer: 1,
+      explain: 'For large sequential transfers, time ≈ bytes ÷ bandwidth. Latency matters only until the pipeline is full.',
+    },
+    {
+      q: 'Where do an LLM\'s weights and KV cache live during serving?',
+      options: ['Registers', 'Shared memory', 'L2 cache', 'HBM'],
+      answer: 3,
+      explain: 'They are far too large for on-chip memory, so they sit in HBM and are streamed in as needed.',
+    },
+    {
+      q: 'Roughly how does the energy of a 32-bit DRAM read compare with a 32-bit multiply?',
+      options: ['About the same', 'About 10× less', 'Over 100× more', 'About 2× more'],
+      answer: 2,
+      explain: 'Horowitz\'s 45 nm figures: about 640 pJ for the DRAM read and about 4 pJ for the multiply.',
+    },
+    {
+      q: 'What makes a kernel efficient with respect to the memory hierarchy?',
+      options: [
+        'Using only registers',
+        'Reusing data many times while it is held in fast on-chip memory',
+        'Reading HBM in random order',
+        'Avoiding shared memory',
+      ],
+      answer: 1,
+      explain: 'Each trip down the ladder is expensive. Good kernels load once into shared memory or registers and reuse it many times.',
+    },
+  ]}
+/>

@@ -1,0 +1,140 @@
+---
+summary: Forget GPUs for a moment and design a chip just for LLM inference, using only what this module taught. You will rediscover HBM, batching, quantization, SRAM-only accelerators and disaggregated serving, and see why each one is a trade-off.
+duration: 20 min
+objectives:
+  - Turn a serving target into bandwidth, capacity and compute requirements
+  - Evaluate design options for decode by the bytes they move
+  - Explain the trade-offs behind GPUs, SRAM-based chips and wafer-scale chips
+  - See why prefill and decode want different hardware
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+This chapter is a design exercise. You are building a chip to serve **Llama-3-70B**. Use pencil and paper; every number follows from the
+chapters you have already read.
+
+## The requirements
+
+- **Model:** 70 B parameters. In BF16 that is **140 GB** of weights.
+- **Per-user speed:** 50 tokens/s, so a decode step must finish in **20 ms**.
+- **Traffic:** many users at once. The more you serve per chip, the lower the cost per token.
+- **Context:** up to 8K tokens per user. With GQA (80 layers, 8 KV heads of 128), the KV cache is about **320 KB per token**, or 2.5 GB per full-length user.
+
+## Step 1: bandwidth
+
+Every decode step must read all the weights ([2.6](/learn/m02/memory-wall-hbm)):
+
+$$
+B \;\geq\; \frac{140\ \text{GB}}{20\ \text{ms}} = 7\ \text{TB/s}
+$$
+
+That is about two H100s' worth of HBM, for **one** user. Compute is not the issue: 140 GFLOP per token in 20 ms is 7 TFLOP/s, under 1% of
+an H100's peak.
+
+<Callout type="insight">
+  The requirement is set by bytes, not FLOPs. Every design below is a different way of making fewer bytes, or more bandwidth, available
+  per token generated.
+</Callout>
+
+## Step 2: the design options
+
+**Option A: more HBM bandwidth.** Put more HBM stacks around a big die. A B200-class chip has about 8 TB/s and 192 GB, which just meets the
+target for a single user. This is the GPU path, and it is limited by HBM cost and packaging.
+
+**Option B: reuse each byte across users (batching).** Serve 64 users in the same step. The weights are read once and used 64 times, so
+bandwidth per token falls 64×. The catch: each user brings their own KV cache, which is read every step and cannot be shared, and the
+batch has to fit in memory alongside the weights. This is the whole of [Module 10](/learn/m10/continuous-batching).
+
+**Option C: fewer bytes per weight (quantization).** At 4 bits, the weights are 35 GB and the bandwidth need falls to 1.75 TB/s. Quality
+has to be checked, and the arithmetic needs to unpack the low-bit formats efficiently ([Module 12](/learn/m12/number-formats)).
+
+**Option D: all on-chip SRAM.** Skip HBM and keep everything in on-chip SRAM, which is far faster. But SRAM is about a hundred times less
+dense than DRAM. A chip with 230 MB of SRAM (the size used by Groq's LPU) needs about **600 chips** to hold 140 GB. A wafer-scale chip
+(Cerebras WSE-3, 44 GB of SRAM on a single wafer) needs several wafers. Very fast per user, but expensive in silicon per model, and
+the chips need fast links between them.
+
+**Option E: split the model across chips.** Spread each layer over $N$ chips (tensor parallelism). Each chip reads $1/N$ of the weights, and the
+bandwidths add up. The cost is communication between chips on every layer ([14.2](/learn/m14/tensor-parallelism)).
+
+| Option | What it changes | Main cost |
+|:--|:--|:--|
+| A. More HBM | raises $B$ | HBM price, packaging, power |
+| B. Batching | divides weight bytes by batch size | KV cache memory, per-user latency |
+| C. Quantization | divides weight bytes by 2–4× | accuracy risk, kernel complexity |
+| D. SRAM only | raises $B$ enormously | capacity: hundreds of chips per model |
+| E. Multi-chip | multiplies $B$ by chip count | interconnect, communication per layer |
+
+Real deployments combine them: GPUs with HBM (A), large batches (B), FP8 or INT4 weights (C), and 4–8-way tensor parallelism (E).
+
+## Step 3: don't forget prefill
+
+Prefill processes thousands of prompt tokens at once. Its arithmetic intensity is in the thousands, so it is **compute-bound**
+([3.4](/learn/m03/prefill-vs-decode)). A chip designed purely for decode bandwidth (Option D, say) can be weak at prefill, and a chip
+designed for prefill FLOPs wastes them on decode. That mismatch is why large deployments run prefill and decode on **separate pools of
+hardware** and transfer the KV cache between them ([15.1](/learn/m15/why-disaggregate)).
+
+<Callout type="warning" title="There is no free design">
+  Every option moves a cost somewhere else: into memory capacity, interconnect, accuracy, latency per user, or price. Inference engineering
+  is largely the work of choosing which cost to pay for a given workload. The rest of this course gives you the tools to measure each one.
+</Callout>
+
+<Callout type="note" title="Design exercises">
+  1. With Option B on one B200 (192 GB, 8 TB/s), how many 8K-context users fit after the 140 GB of BF16 weights? What is the step time if they all decode at once (weights + all their KV)?
+  2. Redo exercise 1 with FP8 weights (70 GB) and an FP8 KV cache. How many users now, and what is the step time?
+  3. For Option D with 230 MB per chip, what fraction of each chip is weights if you also keep a 2.5 GB KV cache per user for 64 users?
+  4. Write down, in one sentence each, which option you would pick for: (a) a chatbot with millions of users, (b) a voice assistant that needs the lowest latency, (c) an overnight batch job summarizing documents.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 1 ends with this thought experiment: designing a processor for LLMs from first principles." />
+  <SourceCard id="FREGLY" note="GPU architecture chapters: how real accelerators trade compute, memory and interconnect." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A 140 GB model must produce one token every 20 ms for a single user. What bandwidth does that need?',
+      options: ['0.7 TB/s', '7 TB/s', '70 TB/s', '2.8 TB/s'],
+      answer: 1,
+      explain: '140 GB ÷ 0.02 s = 7 TB/s, since every weight is read once per step.',
+    },
+    {
+      q: 'Why does batching reduce the bandwidth needed per generated token?',
+      options: [
+        'It shrinks the KV cache',
+        'The weights are read once per step and used for every request in the batch',
+        'It lowers the precision of the weights',
+        'It skips layers',
+      ],
+      answer: 1,
+      explain: 'Weight bytes per step stay the same while tokens per step grow with the batch.',
+    },
+    {
+      q: 'What is the main drawback of an SRAM-only inference chip?',
+      options: [
+        'SRAM is slow',
+        'SRAM holds far less per unit of silicon, so a large model needs hundreds of chips',
+        'SRAM cannot store BF16',
+        'It cannot run attention',
+      ],
+      answer: 1,
+      explain: 'SRAM is fast but much less dense than DRAM, so capacity, and chip count, becomes the cost.',
+    },
+    {
+      q: 'Why do large deployments sometimes run prefill and decode on separate hardware?',
+      options: [
+        'Prefill needs more memory capacity',
+        'Prefill is compute-bound and decode is memory-bound, so each is best served by differently balanced hardware',
+        'Decode cannot use GPUs',
+        'Tokenization must happen between them',
+      ],
+      answer: 1,
+      explain: 'Their arithmetic intensities differ by orders of magnitude, so one hardware balance cannot suit both.',
+    },
+  ]}
+/>

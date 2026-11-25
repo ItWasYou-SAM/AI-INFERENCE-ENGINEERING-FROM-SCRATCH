@@ -1,0 +1,166 @@
+---
+summary: Attention is four small steps, scores, mask, softmax and weighted sum, and the causal mask in the middle is what makes fast generation possible. This chapter walks through each step and ends with the observation that leads to the KV cache.
+duration: 20 min
+objectives:
+  - Compute single-head causal attention by hand from Q, K and V
+  - Explain what the causal mask does and why generation depends on it
+  - Describe multi-head attention and how the heads are split and merged
+  - State how attention's cost grows with sequence length in prefill and in decode
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import AttentionStepper from '../../../components/viz/AttentionStepper.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Attention lets each token pull in information from the tokens before it. For each token, three vectors are projected from the
+residual stream ([1.2](/learn/m01/inside-a-transformer-layer)):
+
+- a **query** $q$: what this token is looking for,
+- a **key** $k$: what this token offers to others,
+- a **value** $v$: what it actually hands over when picked.
+
+$$
+Q = hW_Q \qquad K = hW_K \qquad V = hW_V \qquad\qquad Q, K, V \in \mathbb{R}^{T \times d_h}
+$$
+
+## Four steps
+
+$$
+\operatorname{Attention}(Q, K, V) = \operatorname{softmax}\!\left(\frac{QK^\top}{\sqrt{d_h}} + M\right) V
+$$
+
+1. **Scores.** $S = QK^\top / \sqrt{d_h}$ is a $T \times T$ matrix. Entry $(i, j)$ says how relevant key $j$ is to query $i$.
+   Dividing by $\sqrt{d_h}$ keeps the scores from growing with the head size, which would make softmax too peaked.
+2. **Mask.** $M$ is $0$ on and below the diagonal and $-\infty$ above it. A token cannot look at tokens that come after it.
+3. **Softmax.** Each row becomes a set of weights that sum to 1. The $-\infty$ entries become exactly 0.
+4. **Weighted sum.** Row $i$ of the output is $\sum_j A_{ij}\, v_j$: a blend of the values, weighted by relevance.
+
+<Figure label="fig. 1.3" caption="Single-head causal attention over six tokens. Pick a stage, click a query row, and turn the causal mask off to see what the model would be allowed to peek at.">
+  <AttentionStepper client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Step the query from **The** to **mat**. The first token can only attend to itself, so its weight is always 1.00.
+  2. Turn the **causal mask** off at the *softmax* stage. Early tokens now spend weight on the future, which does not exist yet during generation.
+  3. On the *mask* stage, look at the labels next to the bars: everything before the current query is marked **K,V cached**.
+</Callout>
+
+## Why the mask matters for inference
+
+The causal mask exists for training: the model learns to predict token $t+1$ from tokens $0 \dots t$, so it must not see $t+1$. It has a
+consequence that inference relies on heavily:
+
+<Callout type="insight">
+  Row $i$ of the attention output depends only on $q_i$ and on $k_0 \dots k_i$, $v_0 \dots v_i$. Adding a new token at the end **does not
+  change** any earlier row, or any earlier $k$ or $v$. So the keys and values of past tokens can be computed once and reused for every later
+  step. That reuse is the [KV cache](/learn/m01/why-kv-cache).
+</Callout>
+
+## Multi-head attention
+
+Real models run $n_h$ attention **heads** in parallel, each with its own slice of $W_Q, W_K, W_V$ of width $d_h = d / n_h$
+(typically 64 or 128). Each head can learn a different pattern: one tracks the previous token, another tracks the subject of the sentence.
+The head outputs are concatenated back to width $d$ and mixed by $W_O$.
+
+Implementation-wise, heads are just an extra batch dimension: reshape $[T, d]$ into $[n_h, T, d_h]$, run attention on every head at
+once, and reshape back. Grouped-query attention (GQA) lets several query heads share one K/V head, which shrinks the cache;
+chapter [9.2](/learn/m09/mqa-gqa-mla) covers it.
+
+## What attention costs
+
+| | Prefill ($T$ prompt tokens) | Decode (1 new token, context $n$) |
+|:--|:--|:--|
+| Score matrix | $T \times T$ | $1 \times n$ |
+| FLOPs per layer | $\approx 4T^2 d$ | $\approx 4nd$ |
+| Bytes read | $Q$, $K$, $V$ for $T$ tokens | the **whole** cached $K$ and $V$ for $n$ tokens |
+
+In prefill, attention is quadratic in prompt length, and it is a lot of math on data already loaded: compute-heavy. In decode, a single query
+row has to read every cached key and value to do very little math with each. That makes decode attention memory-bound, and unlike the
+weight matmuls, batching more requests does not help it ([3.3](/learn/m03/roofline)).
+
+## Lab: attention with every intermediate printed 🟢
+
+```python title="labs/m01/1.3/attention.py"
+S = Q @ K.T / np.sqrt(dh)                            # [T, T]
+mask = np.triu(np.ones((T, T), dtype=bool), k=1)     # True above the diagonal = the future
+S_masked = np.where(mask, -np.inf, S)
+A = softmax(S_masked)                                # rows sum to 1
+out = A @ V
+```
+
+```bash
+python labs/m01/1.3/attention.py
+```
+
+```text title="output (excerpt)"
+attention weights A = softmax(rows), each row sums to 1:
+    The attends to 1.00  0.00  0.00  0.00
+    cat attends to 0.43  0.57  0.00  0.00
+    sat attends to 0.61  0.09  0.30  0.00
+   down attends to 0.05  0.03  0.13  0.80
+```
+
+<Callout type="note" title="Exercises">
+  1. Remove the `/ np.sqrt(dh)` and set `dh = 64`. What happens to the rows of `A`?
+  2. Append a fifth token to `x` and recompute. Check that the first four rows of `out` are unchanged.
+  3. Extend the script to two heads by splitting `d_head` and concatenating the outputs.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="MOHITH" note="Attention: queries, keys, values and the causal structure that makes caching possible." />
+  <SourceCard id="CUDA100" note="Days 14, 28 and 31: softmax and attention written as CUDA kernels, previewing Module 8." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why are attention scores divided by √d_head?',
+      options: [
+        'To make the matmul faster',
+        'To keep score magnitudes from growing with head size, so softmax does not become too peaked',
+        'To apply the causal mask',
+        'To normalize each row to sum to 1',
+      ],
+      answer: 1,
+      explain: 'Dot products of random d-dimensional vectors grow like √d. Scaling keeps the softmax input in a useful range.',
+    },
+    {
+      q: 'What does the causal mask guarantee?',
+      options: [
+        'Each token attends to every other token equally',
+        'Token i can only attend to positions 0…i',
+        'Only the last token is computed',
+        'Attention weights are all positive',
+      ],
+      answer: 1,
+      explain: 'Entries above the diagonal are set to −∞, so after softmax token i puts zero weight on later positions.',
+    },
+    {
+      q: 'A new token is appended to the sequence. Which earlier quantities change?',
+      options: [
+        'All keys and values',
+        'Only the attention outputs of earlier tokens',
+        'None of the earlier keys, values or outputs',
+        'The keys but not the values',
+      ],
+      answer: 2,
+      explain: 'Thanks to the causal mask, earlier rows never depend on later tokens. That is why past K and V can be cached.',
+    },
+    {
+      q: 'During decode, how do attention FLOPs and bytes grow with the context length n?',
+      options: [
+        'FLOPs grow as n², bytes stay constant',
+        'Both grow linearly in n, so intensity stays low and the step is memory-bound',
+        'Both stay constant',
+        'FLOPs grow linearly, bytes shrink',
+      ],
+      answer: 1,
+      explain: 'One query row reads n cached keys and values and does a few FLOPs with each, so intensity is roughly constant and small.',
+    },
+  ]}
+/>

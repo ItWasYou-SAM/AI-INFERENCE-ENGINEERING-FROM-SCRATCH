@@ -81,8 +81,8 @@ python labs/m00/0.3/check_env.py       # tells you which labs (🟢 🟡 🔴) w
 
 This is an early, growing course:
 
-- ✅ **Written:** 0.1 What inference engineering is · 0.2 The life of a request · 0.3 How to use the labs · 3.3 The roofline model · 9.1 How big is the KV cache?
-- 📝 **Outlined:** the other 104 chapters, each with its sources already mapped.
+- ✅ **Written:** Module 0 (0.1–0.3) · Module 1, the LLM forward pass (1.1–1.6) · Module 2, GPU hardware first principles (2.1–2.7) · Module 3, the performance mental model (3.1–3.5) · Module 4, CUDA fundamentals (4.1–4.8) · 9.1 How big is the KV cache?
+- 📝 **Outlined:** the other 79 chapters, each with its sources already mapped.
 
 ## ✎ Built on
 

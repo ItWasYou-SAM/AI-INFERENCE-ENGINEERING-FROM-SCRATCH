@@ -1,0 +1,159 @@
+---
+summary: When thousands of threads update the same memory, a simple counter++ goes badly wrong. This chapter shows a data race in action, fixes it with atomics, then makes the fix fast, and explains why parallel floating-point sums aren't reproducible.
+duration: 20 min
+objectives:
+  - Explain why a read-modify-write from many threads is a data race
+  - Fix a race with atomic operations, and reduce their contention with block-level aggregation
+  - Explain why atomic floating-point sums are non-deterministic, and why that matters for inference
+  - Use compute-sanitizer to find memory errors and shared-memory races
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Suppose every thread checks one element and, if it is positive, adds one to a shared counter:
+
+```cpp
+if (x[i] > 0) (*count)++;
+```
+
+On a CPU with one thread this is fine. On a GPU it is a **data race**.
+
+## Why it breaks
+
+`(*count)++` is three steps: **read** the counter into a register, **add** one, **write** it back. Thousands of threads do this at once:
+
+| Time | Thread A | Thread B | count in memory |
+|:--|:--|:--|--:|
+| 1 | read → 5 | | 5 |
+| 2 | | read → 5 | 5 |
+| 3 | add → 6 | add → 6 | 5 |
+| 4 | write 6 | | 6 |
+| 5 | | write 6 | **6** (should be 7) |
+
+One increment is lost. With millions of threads, almost all of them are:
+
+```text title="output (RTX 3050 6GB Laptop)"
+Counting positives among 16777216 elements (expected 5592406):
+  naive    count =      5281  (WRONG)    0.413 ms
+  atomic   count =   5592406  (correct)    0.441 ms
+  block    count =   5592406  (correct)    0.413 ms
+```
+
+The naive kernel counted 5,281 out of 5.6 million: over 99.9% of the increments were lost. Note that it didn't crash or warn. Races produce
+plausible-looking wrong numbers.
+
+## Atomics
+
+An **atomic** operation makes the read-modify-write indivisible: the memory system performs it as one step, so no other thread can slip in
+between.
+
+```cpp
+if (x[i] > 0) atomicAdd(count, 1);
+```
+
+CUDA provides `atomicAdd`, `atomicMax`, `atomicMin`, `atomicExch`, and `atomicCAS` (compare-and-swap, which can build any other atomic,
+[5.3](/learn/m05/atomics-and-cas)). They work on global and shared memory.
+
+## Contention, and how to avoid it
+
+When millions of threads hit **one** address, the atomics serialize on it. Two standard fixes:
+
+- **Aggregate per block.** Count into a `__shared__` variable (shared-memory atomics are cheap), then do one global `atomicAdd` per
+  block. 65,536 global atomics instead of 5.6 million.
+- **Aggregate per warp.** Combine the 32 lanes' contributions with warp shuffles ([5.2](/learn/m05/warp-shuffles)) and let one lane do the atomic.
+
+In the lab, the plain atomic version is barely slower than the others. The likely reason is that the compiler already applies warp
+aggregation to this simple pattern (every lane adding 1 to the same address) on its own. With more complex updates, such as a histogram where lanes hit different addresses, it can't, and explicit
+aggregation can matter a lot ([5.5](/learn/m05/histograms-privatization)).
+
+<Callout type="insight" title="Atomics make floating-point sums non-deterministic">
+  Floating-point addition is not associative: $(a + b) + c$ can differ from $a + (b + c)$ in the last bits. With `atomicAdd` on floats, the
+  order of additions depends on which threads happen to arrive first, so the same input can give slightly different sums on each run. In an LLM
+  this can flip a near-tie between two tokens, which is one reason the same prompt can produce different outputs at temperature 0. Kernels that
+  need bit-exact reproducibility use fixed-order reductions instead of atomics.
+</Callout>
+
+## Tools: let the machine find bugs
+
+`compute-sanitizer` ships with the CUDA toolkit and runs your program under instrumentation:
+
+| Tool | Finds |
+|:--|:--|
+| `compute-sanitizer ./app` (memcheck) | out-of-bounds and misaligned accesses, use of freed memory |
+| `--tool racecheck` | races on **shared** memory, such as a missing `__syncthreads` ([4.4](/learn/m04/shared-memory-syncthreads)) |
+| `--tool synccheck` | invalid barrier use, such as `__syncthreads` in divergent code |
+| `--tool initcheck` | reads of uninitialized device memory |
+
+racecheck does not detect races on global memory like the counter above; those you prevent by design. Run your kernels under the sanitizer
+at least once, on small inputs: it is slow, but it finds bugs that would otherwise show up as rare wrong answers in production.
+
+## Lab: a race, then two fixes 🔴
+
+```bash
+cd labs/m04/4.5 && nvcc -O2 -arch=native race.cu -o race && ./race
+```
+
+<Callout type="note" title="Exercises">
+  1. Run the naive kernel five times. Does the wrong count change between runs? Why?
+  2. Change the counter to a `float` and use `atomicAdd` on floats to sum `x[i] * 0.1f`. Run it several times and print the result to 9 digits. Is it identical each time?
+  3. Implement warp aggregation by hand with `__ballot_sync` and `__popc`, so lane 0 of each warp does one `atomicAdd`.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 2: race conditions, atomics and correctness." />
+  <SourceCard id="CUDA100" note="Days 1–7: atomics and the first lessons in parallel correctness." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why does (*count)++ from many threads give the wrong answer?',
+      options: [
+        'Integers overflow',
+        'The read, add and write of different threads interleave, so increments are lost',
+        'GPU integers are only 16 bits',
+        'The compiler removes it',
+      ],
+      answer: 1,
+      explain: 'Two threads can read the same old value and both write old + 1.',
+    },
+    {
+      q: 'What does atomicAdd guarantee?',
+      options: [
+        'Threads add in index order',
+        'Each read-modify-write is indivisible, so no update is lost',
+        'The result is deterministic for floats',
+        'It runs faster than a normal add',
+      ],
+      answer: 1,
+      explain: 'Atomicity prevents lost updates. It says nothing about the order, so float sums can still vary.',
+    },
+    {
+      q: 'How does per-block aggregation reduce atomic contention?',
+      options: [
+        'It removes the need for atomics',
+        'Threads combine in shared memory first, so only one global atomic is done per block',
+        'It uses a faster type of memory for the global counter',
+        'It sorts the threads',
+      ],
+      answer: 1,
+      explain: 'Shared-memory atomics are cheap, and the global address sees one update per block instead of one per thread.',
+    },
+    {
+      q: 'Why can a float sum done with atomicAdd change between runs?',
+      options: [
+        'The GPU has random rounding',
+        'Floating-point addition is not associative, and the order threads arrive in varies',
+        'atomicAdd is buggy',
+        'Floats lose precision on the GPU only',
+      ],
+      answer: 1,
+      explain: 'Different orders round differently in the last bits. Fixed-order reductions are needed for bit-exact results.',
+    },
+  ]}
+/>

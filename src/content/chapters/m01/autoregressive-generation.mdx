@@ -1,0 +1,169 @@
+---
+summary: An LLM produces one token per forward pass and feeds it back in to get the next. That loop is why answers stream word by word, why latency splits into TTFT and TPOT, and why decode, not prefill, dominates serving cost.
+duration: 15 min
+objectives:
+  - Write the autoregressive generation loop and its stop conditions
+  - Distinguish prefill from decode and connect them to TTFT and TPOT
+  - Explain greedy decoding and temperature, and what each does to the distribution
+  - Estimate end-to-end latency from TTFT, TPOT and output length
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+The model from [1.1](/learn/m01/tokens-embeddings-logits)–[1.3](/learn/m01/attention-step-by-step) outputs one probability distribution
+over the next token. To produce a whole answer, you run it in a loop:
+
+```python
+tokens = tokenize(prompt)
+while True:
+    logits = model(tokens)[-1]          # scores for the next token
+    next_id = sample(logits)            # pick one
+    if next_id == EOS or len(out) == max_tokens:
+        break
+    tokens.append(next_id)              # feed it back in
+    out.append(next_id)
+    stream_to_user(detokenize(next_id))
+```
+
+This is **autoregressive** generation: each output becomes part of the next input. Token 50 cannot start until token 49 exists, so the
+steps for one request are strictly sequential. No amount of hardware can run them in parallel.
+
+## Two phases
+
+The first pass through the loop is different from the rest:
+
+- **Prefill** runs the whole prompt through the model in one forward pass. Hundreds or thousands of tokens are processed together, and the
+  pass ends with the first output token. Its duration is most of the **time to first token (TTFT)**.
+- **Decode** is every pass after that. Each one processes a single new token per request. The time between output tokens is the
+  **time per output token (TPOT)**, also called inter-token latency.
+
+$$
+\text{latency} \approx \text{TTFT} + (n_{\text{out}} - 1) \times \text{TPOT}
+$$
+
+<Callout type="insight" title="Decode dominates">
+  Take a typical chat request on an 8B model: TTFT of 150 ms and TPOT of 15 ms. For a 400-token answer, decode takes
+  399 × 15 ms ≈ **6 s** and prefill takes **0.15 s**. Almost all of the wall-clock time, and most of the GPU time, goes to producing one
+  token at a time. That is why so much of this course is about making decode cheaper.
+</Callout>
+
+## Choosing the next token
+
+`sample(logits)` turns scores into a single id. The two basic knobs:
+
+**Greedy decoding** always takes the highest-scoring token, $\arg\max_i z_i$. It is deterministic and works well for short factual answers,
+but it can get stuck repeating itself.
+
+**Temperature** $\tau$ divides the logits before softmax:
+
+$$
+p_i = \frac{e^{z_i / \tau}}{\sum_j e^{z_j / \tau}}
+$$
+
+- $\tau < 1$ sharpens the distribution toward the top token. $\tau \to 0$ is greedy.
+- $\tau = 1$ uses the model's distribution as trained.
+- $\tau > 1$ flattens it, so less likely tokens get picked more often.
+
+Here are the same logits for *"The capital of France is \_\_\_"* at three temperatures, from the lab below:
+
+| Token | $\tau = 0.5$ | $\tau = 1.0$ | $\tau = 1.5$ |
+|:--|--:|--:|--:|
+| Paris | 0.955 | 0.706 | 0.509 |
+| the | 0.026 | 0.117 | 0.153 |
+| a | 0.014 | 0.086 | 0.125 |
+| France | 0.003 | 0.039 | 0.074 |
+
+Top-k, top-p, min-p and beam search refine this further; they are covered in [Module 11](/learn/m11/sampling-strategies).
+
+<Callout type="note" title="Sampling is cheap; the loop is not">
+  Picking a token from 128K probabilities takes microseconds. The forward pass that produced them takes milliseconds. Sampling matters for
+  quality, but the cost of generation is the number of times you run the loop.
+</Callout>
+
+## When does it stop?
+
+A request ends when the model emits an **end-of-sequence** token, when it hits `max_tokens`, or when the output matches a user-supplied **stop
+string**. For a serving engine this means output length is unknown when a request arrives, so it cannot know in advance how long a request will
+hold its memory. That uncertainty drives the scheduling problems in [Module 10](/learn/m10/continuous-batching).
+
+## Lab: temperature in action 🟢
+
+```python title="labs/m01/1.4/sampling.py"
+def sample(logits, temperature, rng):
+    if temperature == 0:
+        return int(np.argmax(logits))                # greedy
+    p = softmax(logits / temperature)
+    return int(rng.choice(len(p), p=p))
+```
+
+```bash
+python labs/m01/1.4/sampling.py
+```
+
+```text title="output (excerpt)"
+20 samples at each temperature:
+  T=0    1 distinct  e.g. Paris, Paris, Paris, Paris, Paris, Paris
+  T=0.5  1 distinct  e.g. Paris, Paris, Paris, Paris, Paris, Paris
+  T=1.0  6 distinct  e.g. Paris, Paris, Paris, Paris, Paris, Paris
+  T=1.5  5 distinct  e.g. the, Paris, the, Paris, Paris, Lyon
+```
+
+<Callout type="note" title="Exercises">
+  1. A service has TTFT 300 ms and TPOT 25 ms. How long does a 1,000-token answer take? What if TPOT drops to 20 ms?
+  2. Add a `seed` argument so that sampling at τ = 1 is reproducible. Why might a server still give different outputs for the same seed? (Hint: batching changes floating-point summation order.)
+  3. Make the loop in this chapter stop on a stop string as well as on EOS.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="MOHITH" note="The two phases of inference: prefill sets TTFT and decode sets TPOT." />
+  <SourceCard id="CUDA100" note="Sampling kernels appear later in the series and are covered in Module 11." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why can a single request\'s output tokens not be generated in parallel?',
+      options: [
+        'GPUs cannot run more than one kernel at once',
+        'Each token is an input to the forward pass that produces the next one',
+        'The tokenizer is sequential',
+        'Softmax must run on the CPU',
+      ],
+      answer: 1,
+      explain: 'Autoregressive generation feeds each output back in, so step t+1 depends on the result of step t.',
+    },
+    {
+      q: 'TTFT is 200 ms and TPOT is 20 ms. About how long does a 501-token answer take?',
+      options: ['0.2 s', '2.2 s', '10.2 s', '100 s'],
+      answer: 2,
+      explain: '200 ms + 500 × 20 ms = 10.2 s.',
+    },
+    {
+      q: 'What does setting temperature below 1 do?',
+      options: [
+        'Flattens the distribution so rare tokens appear more often',
+        'Sharpens the distribution toward the most likely tokens',
+        'Makes generation faster',
+        'Removes the end-of-sequence token',
+      ],
+      answer: 1,
+      explain: 'Dividing logits by τ < 1 widens the gaps between them, so softmax puts more mass on the top tokens.',
+    },
+    {
+      q: 'Why is output length a problem for a serving engine?',
+      options: [
+        'Long outputs need a different model',
+        'It is unknown when a request arrives, so the engine cannot know how long the request will hold memory',
+        'Outputs must be shorter than the prompt',
+        'It changes the vocabulary size',
+      ],
+      answer: 1,
+      explain: 'Generation stops on EOS, max_tokens or a stop string, so the engine has to schedule without knowing each request\'s final length.',
+    },
+  ]}
+/>

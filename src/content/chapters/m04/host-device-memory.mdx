@@ -1,0 +1,159 @@
+---
+summary: A discrete GPU has its own memory, connected to the CPU by a bus that is ten to a hundred times slower than the GPU's own memory. Allocating, copying and pinning memory correctly, and avoiding copies entirely where possible, is basic inference hygiene.
+duration: 20 min
+objectives:
+  - Allocate, copy and free device memory with the CUDA runtime API
+  - Explain the difference between pageable and pinned host memory
+  - Measure transfer bandwidth and latency, and compare them with on-GPU bandwidth
+  - Identify where host–device transfers appear in an inference server and how to keep them off the critical path
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+The CPU and a discrete GPU each have their own memory. The kernel from [4.1](/learn/m04/kernels-are-not-functions) can only read device
+memory, so data has to be moved across the bus between them, usually PCIe.
+
+## The basic API
+
+```cpp
+float* d;                                                     // a device pointer
+cudaMalloc(&d, bytes);                                        // allocate on the GPU
+cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice);              // CPU -> GPU
+kernel<<<blocks, threads>>>(d, n);
+cudaMemcpy(h, d, bytes, cudaMemcpyDeviceToHost);              // GPU -> CPU (waits for the kernel)
+cudaFree(d);
+```
+
+A device pointer is just an address; nothing in C++ stops you from dereferencing it on the CPU, which crashes. A common convention is to
+name device pointers `d_x` and host pointers `h_x`.
+
+## The bus is the slow part
+
+The lab measures every path on a laptop RTX 3050:
+
+```text title="output (RTX 3050 6GB Laptop)"
+Copying 256 MB:
+  host->device, pageable :    9.0 GB/s
+  host->device, pinned   :   12.9 GB/s
+  device->host, pageable :    8.5 GB/s
+  device->host, pinned   :   13.2 GB/s
+  device->device         :   77.7 GB/s (read + write = 155.4 GB/s of DRAM traffic)
+```
+
+On-GPU copies move data more than 10 times faster than the bus. On a data-centre GPU the gap is larger: PCIe Gen5 x16 gives about
+64 GB/s per direction, while an H100's HBM gives 3,350 GB/s, a ratio of about 50.
+
+<Callout type="insight" title="Data should live on the GPU">
+  Copy model weights to the GPU once, at load time, and keep them there. Keep the KV cache on the GPU. Each decode step should move only
+  token ids in and sampled ids out: a few bytes per request. Any design that ships tensors across PCIe on every step will be limited by the bus.
+</Callout>
+
+## Pageable vs pinned memory
+
+Ordinary `malloc` memory is **pageable**: the operating system can move it or swap it out. The GPU's copy engine can't read such memory
+safely, so the driver first copies it into a hidden **pinned** (page-locked) buffer, then sends it. Allocating pinned memory yourself with
+`cudaMallocHost` skips that staging copy:
+
+- Faster transfers: 12.9 GB/s vs 9.0 GB/s above.
+- **Required for asynchronous copies** that overlap with kernels ([4.6](/learn/m04/launch-async-streams)).
+- But pinned memory can't be swapped out, so pinning too much starves the rest of the system.
+
+## Latency: small copies are expensive
+
+```text title="output"
+Small transfers are dominated by fixed latency:
+          4 bytes:      5.6 us  ->    0.00 GB/s
+       4096 bytes:      6.5 us  ->    0.63 GB/s
+    1048576 bytes:     87.5 us  ->   11.99 GB/s
+   16777216 bytes:   1306.5 us  ->   12.84 GB/s
+```
+
+Every copy pays about **5–6 µs** of fixed cost before any data moves. Copying 4 bytes takes as long as copying 4 KB. Batch small
+transfers together, or avoid them.
+
+<Callout type="warning" title="A hidden sync in every .item()">
+  In PyTorch, `tensor.item()`, `.cpu()`, `.tolist()` and printing a GPU tensor all copy device to host, and a device-to-host copy **waits for
+  every queued kernel to finish**. One such call per decode step serializes CPU and GPU and stalls the pipeline. Serving engines go to great
+  lengths to keep these out of the hot loop ([4.6](/learn/m04/launch-async-streams)).
+</Callout>
+
+## Unified memory
+
+`cudaMallocManaged` returns one pointer usable from both CPU and GPU, and the driver migrates pages on demand when either side touches them.
+It is convenient for prototypes. For performance-critical code, the page faults and migrations are unpredictable, so inference engines
+allocate device memory explicitly. (On chips where CPU and GPU share physical memory, such as Grace Hopper or Apple silicon, the trade-offs change.)
+
+## Where transfers appear in serving
+
+| Transfer | When | Size | Hot path? |
+|:--|:--|:--|:--|
+| Load weights | startup | the whole model (16 GB for 8B BF16) | no, but sets startup time |
+| Token ids in, sampled ids out | every step | bytes | yes: keep tiny, and async |
+| KV cache offload to CPU | when GPU memory is full | MBs per request | yes: hide it or avoid it ([10.2](/learn/m10/scheduler)) |
+| KV transfer between GPUs | disaggregated serving | MBs per request | yes: over NVLink/RDMA, not PCIe if possible ([15.2](/learn/m15/kv-transfer)) |
+
+## Lab: measure your bus 🔴
+
+```bash
+cd labs/m04/4.3 && nvcc -O2 -arch=native transfers.cu -o transfers && ./transfers
+```
+
+<Callout type="note" title="Exercises">
+  1. At the pinned host-to-device rate you measured, how long does loading an 8B BF16 model (16 GB) take? What about from an SSD at 3 GB/s?
+  2. A request's KV cache is 128 MB. How long does swapping it to CPU and back take over this bus? Compare that with one decode step (~5 ms).
+  3. Modify the lab to time 1,000 separate 4-byte copies vs one 4,000-byte copy.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 2: host and device memory, cudaMemcpy and pinned memory." />
+  <SourceCard id="CUDA100" note="Days 1–7: allocating, copying and freeing device memory." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why are copies from pinned host memory faster than from pageable memory?',
+      options: [
+        'Pinned memory is on the GPU',
+        'The GPU can DMA directly from it, skipping a staging copy through a driver buffer',
+        'Pinned memory is compressed',
+        'Pageable memory uses a slower bus',
+      ],
+      answer: 1,
+      explain: 'Pageable memory must first be copied into a pinned staging buffer before the copy engine can read it.',
+    },
+    {
+      q: 'Copying 4 bytes from host to device takes about…',
+      options: ['A few nanoseconds', 'A few microseconds', 'A few milliseconds', 'Exactly 4 bytes ÷ bandwidth'],
+      answer: 1,
+      explain: 'Each transfer has a fixed cost of several microseconds, regardless of size.',
+    },
+    {
+      q: 'Why should model weights stay on the GPU between decode steps?',
+      options: [
+        'The CPU cannot store them',
+        'The bus is far slower than GPU memory, so moving them every step would dominate step time',
+        'CUDA requires it',
+        'To save CPU power',
+      ],
+      answer: 1,
+      explain: 'At ~25–64 GB/s, moving 16 GB would take most of a second per step, versus ~5 ms to read them from HBM.',
+    },
+    {
+      q: 'What does calling tensor.item() on a GPU tensor do to the pipeline?',
+      options: [
+        'Nothing; it is free',
+        'It forces the CPU to wait for all queued GPU work, then copies the value back',
+        'It moves the whole tensor to the CPU permanently',
+        'It launches a new kernel without waiting',
+      ],
+      answer: 1,
+      explain: 'A device-to-host copy is a synchronization point. Done every step, it stalls CPU and GPU in turn.',
+    },
+  ]}
+/>

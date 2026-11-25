@@ -1,0 +1,128 @@
+---
+summary: Every kernel is limited by something, either the arithmetic units, the memory system, or the overhead around it. Knowing which one tells you which optimizations can help and which are a waste of time.
+duration: 15 min
+objectives:
+  - Estimate a kernel's compute time and memory time from its FLOPs and bytes
+  - Classify a kernel as compute-bound, memory-bound or overhead-bound
+  - Explain why an optimization that helps one kind of kernel does nothing for another
+  - Read "percent of peak" numbers to diagnose a real kernel
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Module 2 showed that a GPU has two separate engines: arithmetic units that can do about 989 TFLOP/s, and a memory system that delivers about
+3.35 TB/s (H100 SXM). A kernel needs both, and they work in parallel. Whichever needs more time sets the pace.
+
+## Two clocks running at once
+
+For a kernel that does $F$ floating-point operations and moves $Q$ bytes to and from HBM:
+
+$$
+T_{\text{compute}} = \frac{F}{P_{\text{peak}}} \qquad T_{\text{memory}} = \frac{Q}{B} \qquad T \;\gtrsim\; \max\big(T_{\text{compute}},\, T_{\text{memory}}\big)
+$$
+
+- If $T_{\text{memory}} > T_{\text{compute}}$, the kernel is **memory-bound**: the arithmetic units wait for data.
+- If $T_{\text{compute}} > T_{\text{memory}}$, it is **compute-bound**: the data arrives faster than it can be used.
+
+Two worked examples on an H100:
+
+| Kernel | FLOPs | Bytes | $T_{\text{compute}}$ | $T_{\text{memory}}$ | Bound |
+|:--|--:|--:|--:|--:|:--|
+| Vector add, $10^9$ FP32 elements | $10^9$ | 12 GB | 15 µs (FP32, 67 TFLOP/s) | **3.6 ms** | memory, by 240× |
+| Matmul, $8192^3$, BF16 | $1.1 \times 10^{12}$ | 0.4 GB | **1.1 ms** | 0.12 ms | compute, by 9× |
+
+The vector add reads two numbers and writes one (12 bytes) for each single add. No amount of extra arithmetic hardware would speed it up.
+The matmul reuses each loaded number thousands of times, so the memory system has time to spare.
+
+## The third regime: overhead
+
+Small operations often hit neither limit. Each kernel launch costs a few microseconds of CPU and driver work, and Python adds more. If a
+kernel's real work takes 2 µs but launching it takes 5 µs, the kernel is **overhead-bound**, and the GPU sits idle between launches.
+
+<Callout type="warning" title="Decode is often overhead-bound at small sizes">
+  A decode step of a small model launches hundreds of small kernels per token. At batch 1, each one finishes in microseconds, so launch
+  overhead can take a large share of the step. That is why engines capture the whole step as a **CUDA Graph** and replay it with one launch
+  ([8.7](/learn/m08/torch-compile-cuda-graphs)). You saw the same effect on a CPU in the [1.6 lab](/learn/m01/tiny-gpt-numpy).
+</Callout>
+
+## Why the label matters
+
+The regime tells you which optimizations can possibly help:
+
+| If the kernel is… | These help | These do nothing |
+|:--|:--|:--|
+| **Memory-bound** | moving fewer bytes: quantization, fusion, better reuse, batching | faster arithmetic, tensor cores, FP8 *math* |
+| **Compute-bound** | tensor cores, lower-precision math, avoiding wasted FLOPs | caching, compression of data |
+| **Overhead-bound** | CUDA Graphs, fusing kernels, bigger batches, less Python | anything inside the kernel |
+
+<Callout type="insight">
+  Most LLM decode work is memory-bound, and most prefill work is compute-bound ([3.4](/learn/m03/prefill-vs-decode)). So the same model
+  needs opposite optimizations in its two phases. Many optimizations that look good in a benchmark have no effect in serving because they
+  target the wrong limit.
+</Callout>
+
+## Diagnosing a real kernel
+
+Profilers report a kernel's achieved FLOP/s and achieved bandwidth, often as a **percentage of peak** (Nsight Compute calls this
+"Speed of Light", [7.2](/learn/m07/nsight-systems-vs-compute)). Read them together:
+
+- High % of memory bandwidth, low % of compute: memory-bound and already efficient. Reduce bytes.
+- High % of compute, low % of bandwidth: compute-bound. Use better math (tensor cores, lower precision).
+- Low on both: neither limit is reached. Look for overhead, poor occupancy ([2.5](/learn/m02/occupancy-latency-hiding)), or a bad access pattern.
+
+<Callout type="note" title="Exercises">
+  1. A kernel applies RMSNorm to 4,096 tokens × 4,096 dims in BF16: about 5 FLOPs per element, reading and writing each element once. Is it compute- or memory-bound on an H100, and by how much?
+  2. A profiler reports 2.9 TB/s and 12 TFLOP/s for a kernel on an H100. Which regime is it in, and is it well optimized?
+  3. A kernel takes 4 µs and is launched 600 times per decode step. With 5 µs launch overhead each, what fraction of the step is overhead if nothing overlaps?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Ch 33–35: idle ALUs and the two hard ceilings, compute and bandwidth." />
+  <SourceCard id="TTFT" note="Week 1: compute-bound vs memory-bound, and why decode is the latter." />
+  <SourceCard id="MOHITH" note="The two phases of inference and what limits each." />
+  <SourceCard id="FREGLY" note="The arithmetic-intensity chapter: diagnosing what a kernel is bound by." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A kernel does 10 GFLOP and moves 10 GB on an H100 (989 TFLOP/s, 3.35 TB/s). What limits it?',
+      options: ['Compute', 'Memory bandwidth', 'Both equally', 'Neither'],
+      answer: 1,
+      explain: 'Compute time ≈ 10 µs; memory time ≈ 3 ms. Memory dominates by about 300×.',
+    },
+    {
+      q: 'Which optimization helps a memory-bound kernel?',
+      options: ['Using tensor cores', 'Switching the math to FP8 while keeping data in BF16', 'Storing the data in fewer bytes', 'Raising the clock of the ALUs'],
+      answer: 2,
+      explain: 'A memory-bound kernel is limited by bytes moved. Shrinking the data shrinks the time; faster math does not.',
+    },
+    {
+      q: 'What does "overhead-bound" mean?',
+      options: [
+        'The kernel uses too much memory',
+        'Time is dominated by launch and host-side costs around the kernel, not by its math or memory traffic',
+        'The kernel has too many FLOPs',
+        'The GPU is overheating',
+      ],
+      answer: 1,
+      explain: 'Small kernels can finish faster than the CPU can launch them, leaving the GPU idle between launches.',
+    },
+    {
+      q: 'A profiler shows 15% of peak bandwidth and 10% of peak compute. What should you suspect first?',
+      options: [
+        'The kernel is compute-bound',
+        'The kernel is memory-bound',
+        'Neither limit is reached: look for overhead, low occupancy or a poor access pattern',
+        'The GPU is faulty',
+      ],
+      answer: 2,
+      explain: 'A kernel that is truly bound by a resource uses a high fraction of it. Low numbers on both mean something else is in the way.',
+    },
+  ]}
+/>

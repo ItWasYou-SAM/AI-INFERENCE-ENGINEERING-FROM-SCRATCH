@@ -1,0 +1,152 @@
+---
+summary: Shared memory is a small, fast scratchpad that the threads of one block share, and __syncthreads is the barrier that makes sharing safe. Together they let a block load data once and reuse it many times, which is how most fast kernels work.
+duration: 20 min
+objectives:
+  - Declare and use shared memory, and state its scope, lifetime and size limits
+  - Use __syncthreads correctly, and recognize the two ways to misuse it
+  - Write a block-level tree reduction in shared memory
+  - Explain why shared memory is the foundation of tiled matmul and attention kernels
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Threads in a block can do something threads in different blocks can't: share a fast on-chip memory and wait for each other.
+
+## Shared memory
+
+Declare an array with `__shared__` inside a kernel:
+
+```cpp
+__shared__ float s[256];
+```
+
+- **Scope:** one copy per **block**. All threads in the block see the same array; other blocks have their own.
+- **Lifetime:** created when the block starts, gone when it ends. Results must be written to global memory to survive.
+- **Speed:** it sits in the SM next to the cores, with latency of roughly 30 cycles versus hundreds for HBM ([2.3](/learn/m02/bandwidth-and-memory-hierarchy)).
+- **Size:** 48 KB per block by default; more with an opt-in (up to about 100 KB on consumer Ampere GPUs, 227 KB on an H100). Using more
+  shared memory per block means fewer blocks fit per SM ([2.5](/learn/m02/occupancy-latency-hiding)).
+
+## __syncthreads
+
+`__syncthreads()` is a **barrier**: no thread in the block continues past it until every thread in the block has reached it. It also
+makes all shared-memory writes before the barrier visible to all threads after it.
+
+You need it whenever a thread reads a value that a *different* thread wrote. Without it, the reader may run ahead of the writer.
+
+## A block-level sum
+
+The classic first use is a tree reduction ([5.1](/learn/m05/reduction-trees) goes much further). Each block sums 256 numbers:
+
+```cpp
+// labs/m04/4.4/shared_sum.cu, without the template switch that turns the barriers off
+__global__ void block_sum(const float* in, float* out, int n) {
+    __shared__ float s[256];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * 256 + tid;
+    s[tid] = (i < n) ? in[i] : 0.0f;          // 1. each thread loads one element
+    __syncthreads();                          //    every load must land before anyone reads
+
+    for (int stride = 128; stride > 0; stride /= 2) {
+        if (tid < stride) s[tid] += s[tid + stride];   // 2. pairwise sums: 128, 64, ..., 1
+        __syncthreads();                      //    finish this level before the next reads it
+    }
+    if (tid == 0) out[blockIdx.x] = s[0];     // 3. one thread writes the block total
+}
+```
+
+256 values become 1 in $\log_2 256 = 8$ levels, with every load from HBM done exactly once.
+
+## What a missing barrier does
+
+The lab runs the kernel 20 times with and without the `__syncthreads()` calls:
+
+```text title="output (RTX 3050 6GB Laptop)"
+Summing 65536 blocks of 256 elements:
+  with __syncthreads()       wrong block sums:        0 of 1310720 (20 runs)
+  without __syncthreads()    wrong block sums:  1310720 of 1310720 (20 runs)
+```
+
+Every single block sum was wrong. Different warps in a block run independently, so without the barrier a thread reads `s[tid + stride]`
+before the warp responsible for it has written it.
+
+<Callout type="warning" title="Two rules for __syncthreads">
+  1. **Every thread in the block must reach the same barrier.** Putting `__syncthreads()` inside an `if` that only some threads enter is undefined behaviour: the kernel can hang or silently compute garbage.
+  2. **It only synchronizes one block.** There is no `__syncthreads` across blocks. For that you need a new kernel launch ([4.1](/learn/m04/kernels-are-not-functions)).
+
+  `compute-sanitizer --tool racecheck ./shared_sum` detects the missing-barrier race automatically. Make a habit of running it.
+</Callout>
+
+## Why it matters for LLM kernels
+
+<Callout type="insight">
+  Shared memory is how a kernel turns an intensity of 1 into an intensity of 100. A tiled matmul loads a tile of A and a tile of B into
+  shared memory once, then every thread in the block reuses them many times ([6.1](/learn/m06/tiled-matmul)). FlashAttention does the same
+  with blocks of Q, K and V, keeping the whole score computation on-chip ([8.5](/learn/m08/flashattention)). Softmax and RMSNorm use it for their
+  row-wise reductions ([5.7](/learn/m05/softmax-kernels), [8.1](/learn/m08/norms-fused-residual)).
+</Callout>
+
+## Lab: shared memory and the barrier 🔴
+
+```bash
+cd labs/m04/4.4 && nvcc -O2 -arch=native shared_sum.cu -o shared_sum && ./shared_sum
+```
+
+<Callout type="note" title="Exercises">
+  1. Remove only the *first* `__syncthreads()` (after the load). How many sums are wrong now?
+  2. The loop has idle threads: at stride 1, only one of 256 threads works. How many warps are fully idle at each level?
+  3. Add a second kernel that sums the 65,536 block totals, giving the total of all 16 M elements. Check it on the CPU.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 2: shared memory and block-level synchronization." />
+  <SourceCard id="CUDA100" note="Days 1–7: shared memory, __syncthreads and the first reductions." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Which threads can see a __shared__ array?',
+      options: ['All threads in the grid', 'All threads in the same block', 'Only the thread that declared it', 'Threads in the same warp only'],
+      answer: 1,
+      explain: 'Each block has its own copy, shared by all of its threads.',
+    },
+    {
+      q: 'What does __syncthreads() guarantee?',
+      options: [
+        'All threads in the grid have reached it',
+        'All threads in the block have reached it, and their earlier shared-memory writes are visible',
+        'The kernel has finished',
+        'Global memory is flushed to the CPU',
+      ],
+      answer: 1,
+      explain: 'It is a block-wide barrier with memory visibility for the block.',
+    },
+    {
+      q: 'Why is __syncthreads() inside if (threadIdx.x < 32) a bug?',
+      options: [
+        'It is too slow',
+        'Not every thread of the block reaches it, which is undefined behaviour and can hang',
+        'Shared memory cannot be used in an if',
+        'It is not a bug',
+      ],
+      answer: 1,
+      explain: 'A barrier must be reached by all threads of the block, or by none.',
+    },
+    {
+      q: 'Why do tiled matmul kernels use shared memory?',
+      options: [
+        'Shared memory is larger than HBM',
+        'To load each tile from HBM once and reuse it across many threads, raising arithmetic intensity',
+        'To communicate between blocks',
+        'Tensor cores can only read shared memory',
+      ],
+      answer: 1,
+      explain: 'Reuse from on-chip memory turns one HBM load into many FLOPs.',
+    },
+  ]}
+/>

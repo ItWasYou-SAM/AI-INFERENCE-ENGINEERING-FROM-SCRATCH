@@ -1,0 +1,139 @@
+---
+summary: A CPU core is a marvel built to make one thread fast, and that is exactly why you cannot fit ten thousand of them on a chip. GPUs make the opposite bet, and the bet only pays off when there is enough parallel work to feed it.
+duration: 15 min
+objectives:
+  - Explain where a CPU core's transistors and power go, and why
+  - Distinguish latency-optimized from throughput-optimized design
+  - Explain why clock speeds stopped rising and what that did to chip design
+  - Say what a GPU gives up to fit tens of thousands of lanes on one chip
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+An H100 has 16,896 FP32 lanes. A top server CPU has about 96 to 192 cores. Both are made on similar processes with tens of billions
+of transistors. So why doesn't someone just put 10,000 CPU cores on a chip?
+
+## Where a CPU core's transistors go
+
+A modern CPU core runs a **single thread** as fast as it possibly can. Very little of its area does arithmetic. Most of it exists to keep
+that one instruction stream from ever waiting:
+
+- **Out-of-order execution.** Hundreds of instructions in flight, reordered on the fly so independent ones run while others wait.
+- **Branch prediction.** Guess which way each `if` goes, long before the condition is known, and speculatively run ahead.
+- **Large caches.** Megabytes of L1, L2 and L3 per core, so that most loads return in a few nanoseconds instead of ~100 ns from DRAM.
+- **Wide decode and rename logic, prefetchers, store buffers**, and the bookkeeping to undo every wrong guess.
+
+All of that machinery attacks one problem: **latency**. It makes a single chain of dependent instructions finish sooner.
+
+<Callout type="insight">
+  A CPU core is mostly a latency-hiding machine with a small calculator attached. Copy it 10,000 times and you copy the latency-hiding
+  machinery 10,000 times too. You would run out of area and power long before you ran out of useful work for it.
+</Callout>
+
+## The power wall
+
+Until the mid-2000s, each process shrink made transistors faster *and* lower-power at the same time (**Dennard scaling**), so clocks
+kept rising. Then leakage current stopped voltage from falling with size, and since dynamic power grows roughly as
+
+$$
+P \propto C\,V^2 f,
+$$
+
+raising $f$ meant raising $V$, and power went up much faster than speed. Clocks have sat around 3–5 GHz ever since. More transistors kept
+arriving, but they could no longer be spent on making one thread faster. The only way to use them was **more parallel units**, each simpler
+and slower than a CPU core, running at a power level the chip can cool.
+
+## The GPU's bet
+
+A GPU spends its transistors the other way round:
+
+| | CPU core | GPU streaming multiprocessor (SM) |
+|:--|:--|:--|
+| Goal | finish one thread soon | finish many threads per second |
+| Hides memory latency with | big caches, speculation, reordering | switching between thousands of waiting threads |
+| Arithmetic per unit | a few wide SIMD units | 128 FP32 lanes + 4 tensor cores |
+| Instruction control | per thread | shared by 32 threads (a **warp**, [2.4](/learn/m02/warps-simt-branching)) |
+| Count on chip | ~100 | 132 SMs on an H100 |
+
+The GPU drops speculation and most of the cache, and shares one instruction decoder across 32 lanes. In exchange it fits far more
+arithmetic per square millimetre and per watt. An H100 reaches about **67 TFLOP/s** in plain FP32 and **989 TFLOP/s** in BF16 on its tensor
+cores. A large server CPU manages a few TFLOP/s.
+
+<Callout type="warning" title="The price of the bet">
+  A single GPU thread is **slow**: no speculation, little cache, and a clock under 2 GHz. A GPU only wins when there are tens of
+  thousands of independent pieces of work to keep its lanes busy. The rest of this module is about what "enough parallel work" means,
+  and Chapter [4.8](/learn/m04/when-not-to-use-a-gpu) covers when there isn't enough.
+</Callout>
+
+## Why this matters for inference
+
+An LLM forward pass is almost entirely matrix multiplication: billions of independent multiply-adds per token
+([1.2](/learn/m01/inside-a-transformer-layer)). That is exactly the work a throughput machine is built for. But generation also has a
+strictly sequential outer loop ([1.4](/learn/m01/autoregressive-generation)), and each step has to fetch every weight from memory. The
+GPU's huge arithmetic rate only helps if the data arrives fast enough, which is the subject of [2.3](/learn/m02/bandwidth-and-memory-hierarchy)
+and [2.6](/learn/m02/memory-wall-hbm).
+
+<Callout type="note" title="Exercises">
+  1. A core spends 5% of its area on arithmetic. If you strip it down to the arithmetic plus a minimal decoder (say 15% of the original area), roughly how many fit in the same space? What did you lose?
+  2. Look up the die area and core count of a current server CPU and of an H100. Compute area per FP32 lane for each.
+  3. Why does a GPU not need a branch predictor to be fast? (Hint: what does it do instead while waiting?)
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 1: why CPUs are built for latency, the power wall, and why that leads to GPUs." />
+  <SourceCard id="FREGLY" note="GPU architecture chapters: SMs, CUDA cores and tensor cores compared with CPU cores." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'What does most of a modern CPU core\'s area exist to do?',
+      options: [
+        'Floating-point arithmetic',
+        'Hide latency for a single thread: caches, branch prediction, out-of-order execution',
+        'Drive the display',
+        'Store the operating system',
+      ],
+      answer: 1,
+      explain: 'Arithmetic units are a small share. Most of the core keeps one instruction stream from stalling.',
+    },
+    {
+      q: 'Why did clock speeds stop rising in the mid-2000s?',
+      options: [
+        'Transistors stopped shrinking',
+        'Voltage stopped scaling down, so higher clocks meant much higher power',
+        'Software could not use faster clocks',
+        'Memory got slower',
+      ],
+      answer: 1,
+      explain: 'Power grows as C·V²·f. Without voltage scaling, extra frequency costs too much power and heat.',
+    },
+    {
+      q: 'How does a GPU hide memory latency instead of relying on big caches and speculation?',
+      options: [
+        'It runs at a higher clock speed',
+        'It switches to other ready threads while some wait on memory',
+        'It predicts the memory contents',
+        'It does not need to: GPU memory has no latency',
+      ],
+      answer: 1,
+      explain: 'With thousands of threads resident, there is almost always someone ready to issue while others wait.',
+    },
+    {
+      q: 'When does a GPU lose to a CPU?',
+      options: [
+        'Large matrix multiplications',
+        'Workloads with little parallelism, where one slow thread must do everything in order',
+        'Any floating-point work',
+        'Workloads that use a lot of memory',
+      ],
+      answer: 1,
+      explain: 'A single GPU thread is slow. Without lots of independent work, the GPU\'s parallel lanes sit idle.',
+    },
+  ]}
+/>

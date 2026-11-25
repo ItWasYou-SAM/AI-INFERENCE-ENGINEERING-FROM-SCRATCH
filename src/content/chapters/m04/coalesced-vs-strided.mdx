@@ -1,0 +1,154 @@
+---
+summary: A warp's 32 loads are served together, in 32-byte pieces. When the 32 addresses are next to each other, memory delivers exactly what's needed; when they're spread out, most of every fetched byte is thrown away. Access patterns can cost a factor of four or more in bandwidth.
+duration: 20 min
+objectives:
+  - Explain how the memory system serves a warp's loads in 32-byte sectors
+  - Predict a pattern's efficiency from its stride
+  - Fix strided access with layout changes or a shared-memory transpose
+  - Recognize coalescing questions in KV-cache layouts and embedding gathers
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import CoalescingViz from '../../../components/viz/CoalescingViz.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+The 32 threads of a warp execute each load instruction together ([2.4](/learn/m02/warps-simt-branching)). The memory system doesn't fetch
+32 separate 4-byte values. It looks at all 32 addresses, works out which **32-byte sectors** of memory they fall in, and fetches each
+sector once.
+
+## Coalescing
+
+If lane $i$ reads `x[i]`, the 32 floats are adjacent: 128 bytes in 4 sectors. Every byte fetched is used. This is a **coalesced** access.
+
+If lane $i$ reads `x[8*i]`, each float lands in its own sector. The hardware fetches 32 sectors, 1,024 bytes, to deliver 128 useful bytes.
+Seven-eighths of the bandwidth is wasted.
+
+$$
+\text{efficiency} = \frac{\text{bytes the warp asked for}}{\text{sectors fetched} \times 32}
+$$
+
+<Figure label="fig. 4.7" caption="One warp's load. Each line connects a lane to the address it reads; shaded cells are the 32-byte sectors the memory system has to fetch. Pick an access pattern.">
+  <CoalescingViz client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Compare **x[i]** and **x[i + 1]**. Misalignment costs one extra sector: 80% instead of 100%. Usually fine.
+  2. Try **x[2 * i]**, then **x[8 * i]**. Efficiency halves, then drops to 12.5%, and stays there for larger strides.
+  3. Try the **gather**. Each lane fetches its own sector, just like a large stride. Embedding lookups and paged-KV block tables look like this.
+</Callout>
+
+## Measured
+
+The lab reads with a stride and writes coalesced:
+
+```text title="output (RTX 3050 6GB Laptop)"
+Strided read, coalesced write (128 MB each way):
+  stride      GB/s  useful bytes per 32-byte sector
+       1     157.9  32 of 32
+       2     106.1  16 of 32
+       4      64.6   8 of 32
+       8      35.8   4 of 32
+      16      35.8   4 of 32
+      32      35.8   4 of 32
+      64      35.8   4 of 32
+```
+
+Stride 1 reaches 158 GB/s, close to this GPU's ~168 GB/s peak. From stride 8 on, every lane is in its own sector and the rate settles at
+36 GB/s, **4.4× slower** for the same work. (It doesn't fall the full 8× because the writes stay coalesced and the caches help a little.)
+
+## The classic case: transpose
+
+Transposing a matrix reads rows and writes columns, or the reverse. One side must be strided. The fix is to go through shared memory: read a
+32 × 32 tile with coalesced row reads, `__syncthreads()`, then write it out as coalesced rows of the transposed tile.
+
+```cpp
+// simplified from labs/m04/4.7/coalescing.cu (which loops over 4 rows per thread)
+__shared__ float tile[32][33];                 // +1 column avoids bank conflicts (6.4)
+tile[ty][tx] = in[(y0 + ty) * N + x0 + tx];    // coalesced read of a row
+__syncthreads();
+out[(x0 + ty) * N + y0 + tx] = tile[tx][ty];   // coalesced write of a row of the transpose
+```
+
+```text title="output"
+Transpose 4096 x 4096 floats:
+  naive    2.073 ms    64.7 GB/s  PASS
+  tiled    0.876 ms   153.3 GB/s  PASS
+```
+
+The tiled version is **2.4× faster** and runs near peak bandwidth. Shared memory acts as a reorder buffer: the strided access happens on chip,
+where it is cheap.
+
+<Callout type="insight" title="Layout is a performance decision">
+  Where possible, choose data layouts so that the dimension a warp walks along is contiguous in memory. In inference this shows up everywhere:
+  the KV cache is laid out so that each head's vectors for consecutive tokens can be read in long contiguous runs; paged KV caches use
+  blocks of 16 or more tokens so that each gather still reads contiguous chunks ([9.3](/learn/m09/paged-attention)); quantized weights are
+  repacked offline into the order the kernel reads them ([12.4](/learn/m12/w4a16-kernel)).
+</Callout>
+
+## Other tools
+
+- **Vector loads.** Reading `float4` (16 bytes per lane) issues fewer, wider requests: one instruction moves 512 bytes per warp.
+- **Structure of arrays.** An array of structs `{x, y, z, w}` makes a warp reading only `x` stride by 16 bytes. Separate arrays for each field
+  keep each read coalesced.
+- **Let the profiler tell you.** Nsight Compute reports sectors per request for every load: 4 for coalesced 4-byte loads, up to 32 for the worst case ([7.2](/learn/m07/nsight-systems-vs-compute)).
+
+## Lab: stride and transpose 🔴
+
+```bash
+cd labs/m04/4.7 && nvcc -O2 -arch=native coalescing.cu -o coalescing && ./coalescing
+```
+
+<Callout type="note" title="Exercises">
+  1. Change `strided_copy` to read coalesced and *write* strided. Is it faster or slower than strided reads?
+  2. Remove the `+ 1` padding from the tile. How does the tiled transpose's time change? (Chapter [6.4](/learn/m06/bank-conflicts) explains why.)
+  3. Rewrite `strided_copy` at stride 1 using `float4` loads and stores. Does it get any closer to peak?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 2: memory coalescing and access patterns." />
+  <SourceCard id="CUDA100" note="Days 1–7: coalesced access and the shared-memory transpose." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Lane i reads x[i] (4-byte floats, aligned). How many 32-byte sectors does the warp fetch?',
+      options: ['1', '4', '8', '32'],
+      answer: 1,
+      explain: '32 × 4 bytes = 128 bytes = 4 sectors.',
+    },
+    {
+      q: 'Lane i reads x[16*i]. What fraction of fetched bytes is used?',
+      options: ['100%', '50%', '25%', '12.5%'],
+      answer: 3,
+      explain: 'Each lane is in its own 32-byte sector and uses 4 bytes of it: 4/32 = 12.5%.',
+    },
+    {
+      q: 'How does the tiled transpose avoid strided global memory access?',
+      options: [
+        'It skips half the elements',
+        'It reads rows into shared memory, then writes rows of the transpose, doing the reordering on chip',
+        'It uses atomics',
+        'It transposes on the CPU',
+      ],
+      answer: 1,
+      explain: 'Both global reads and writes become contiguous; only the shared-memory accesses are strided.',
+    },
+    {
+      q: 'Why do paged KV caches use blocks of 16 or more tokens rather than 1?',
+      options: [
+        'To make the block table smaller only',
+        'So each gather reads a contiguous run of memory, keeping accesses coalesced',
+        'Because GPUs cannot address single tokens',
+        'To make attention compute-bound',
+      ],
+      answer: 1,
+      explain: 'Larger blocks turn a random gather into contiguous chunks that the memory system can serve efficiently. (Smaller block tables are a bonus.)',
+    },
+  ]}
+/>

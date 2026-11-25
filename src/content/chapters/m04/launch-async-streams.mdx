@@ -1,0 +1,156 @@
+---
+summary: The CPU doesn't run kernels; it writes them into a queue that the GPU drains. Understanding that queue explains launch overhead, why hidden synchronizations hurt, how streams overlap copies with compute, and why serving engines replay CUDA Graphs.
+duration: 20 min
+objectives:
+  - Describe what happens between a kernel launch and the kernel running
+  - Measure launch overhead and explain when it dominates
+  - Use streams and async copies to overlap transfers with compute
+  - Explain what CUDA Graphs do and why inference engines rely on them
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import StreamTimeline from '../../../components/viz/StreamTimeline.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+In [4.1](/learn/m04/kernels-are-not-functions) a launch returned after 4.6 µs while the kernel ran for 5 ms. Here is what happens in between.
+
+## Anatomy of a launch
+
+1. **CPU, your code:** `kernel<<<grid, block, smem, stream>>>(args)`.
+2. **CPU, CUDA runtime and driver:** check the arguments, pack them, and write a launch command into a **queue** in memory the GPU can read.
+   This takes a few microseconds of CPU time, and the call returns.
+3. **GPU front end:** reads commands from the queue in order and, once the previous work in the same stream is done, hands the blocks to the SMs.
+4. **SMs:** run the blocks. When the last one finishes, the next command in the stream can start.
+
+So the CPU and GPU run side by side, connected by a queue. As long as the CPU stays ahead, the GPU never waits.
+
+## Launch overhead
+
+The lab launches 20,000 empty kernels:
+
+```text title="output (RTX 3050 6GB Laptop)"
+1) 20000 empty launches: 2.72 us per launch
+2) same kernels via a CUDA Graph: 0.64 us per kernel
+```
+
+2.7 µs sounds small. But a decode step of an 8B model runs several hundred kernels (norms, matmuls, attention, activations, for each of 32
+layers), and at small batch many of them finish in a few microseconds. If the CPU needs 2.7 µs to launch a 3 µs kernel, the GPU spends
+much of the step idle, waiting for the next command. Decode becomes **overhead-bound** ([3.1](/learn/m03/compute-vs-memory-bound)).
+
+## CUDA Graphs
+
+A **CUDA Graph** records a whole sequence of launches once, then replays it with a single call. The driver has already validated and packed
+every command, so replay costs far less per kernel: 0.64 µs instead of 2.72 µs in the lab, and the CPU is free during the replay.
+
+<Callout type="insight" title="Why every serving engine uses graphs">
+  vLLM and SGLang capture the decode step as CUDA Graphs for a set of common batch sizes at startup, then replay the matching one each
+  step. The catch: a graph fixes shapes and memory addresses at capture time, so engines pad batches to the nearest captured size and use
+  pre-allocated buffers. Chapter [8.7](/learn/m08/torch-compile-cuda-graphs) builds this.
+</Callout>
+
+## Streams
+
+A **stream** is one of those queues. Work in the same stream runs in order. Work in **different** streams may run at the same time, and
+the GPU has separate engines for computing, copying host-to-device and copying device-to-host. So with several streams, one chunk's kernel can
+run while the next chunk is copied in and the previous one is copied out.
+
+Three requirements:
+
+- Use `cudaMemcpyAsync` with a stream argument, not `cudaMemcpy`.
+- The host memory must be **pinned** ([4.3](/learn/m04/host-device-memory)), or the copy silently becomes synchronous.
+- Split the work into chunks, each with its own stream.
+
+<Figure label="fig. 4.6" caption="A copy-in, kernel and copy-out pipeline. Synchronous code runs each stage after the last and blocks the CPU. Chunked async code overlaps the three engines. Change the stage lengths and the number of streams.">
+  <StreamTimeline client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Compare the two modes with equal stages (8, 6, 8 ms). Four streams cut the time roughly in half.
+  2. Raise the streams to 8. The gain flattens: total time can't drop below the longest stage plus a little fill and drain.
+  3. Make the kernel 20 ms and the copies 2 ms. Overlap hardly helps when one stage dominates.
+</Callout>
+
+The lab does this for real with 128 MB:
+
+```text title="output"
+3) copy in + kernel + copy out, 128 MB:
+   one stream     :   23.00 ms
+   4 streams      :   14.66 ms  (1.57x)
+```
+
+## Synchronization points
+
+These all make the CPU wait for the GPU:
+
+- `cudaDeviceSynchronize()`, `cudaStreamSynchronize(s)`, `cudaEventSynchronize(e)`
+- `cudaMemcpy` (the non-async one), and any device-to-host copy that needs the result
+- In PyTorch: `.item()`, `.cpu()`, `.tolist()`, `print(tensor)`, and data-dependent Python control flow on GPU values
+
+Each one drains the queue. The GPU finishes, then waits idle while the CPU decides what to do next.
+
+<Callout type="warning" title="The decode loop's hardest sync">
+  Each decode step must know the sampled token before it can start the next step, and the scheduler must know which requests have finished.
+  Modern engines keep the CPU a step ahead: they schedule step $t+1$ while the GPU runs step $t$, and they keep sampling on the GPU so only token
+  ids cross the bus ([10.5](/learn/m10/vllm-v1-architecture)).
+</Callout>
+
+## Lab: overhead, graphs and streams 🔴
+
+```bash
+cd labs/m04/4.6 && nvcc -O2 -arch=native streams.cu -o streams && ./streams
+```
+
+<Callout type="note" title="Exercises">
+  1. Change `streams.cu` to use `malloc` instead of `cudaMallocHost`. What happens to the 4-stream time, and why?
+  2. Profile the program with `nsys profile ./streams` and open the timeline. Find the overlapping copies and kernels ([7.2](/learn/m07/nsight-systems-vs-compute)).
+  3. A decode step launches 600 kernels averaging 4 µs each. Estimate the step time with launch overhead (2.7 µs, not overlapped) and with a graph (0.64 µs).
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 2: asynchronous execution, streams and events." />
+  <SourceCard id="CUDA100" note="Days 1–7: launch configuration and timing kernels correctly." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'What does the CPU actually do when it launches a kernel?',
+      options: [
+        'Runs the kernel on its own cores first',
+        'Writes a command into a queue that the GPU reads, then returns',
+        'Waits for the GPU to be idle',
+        'Copies the kernel\'s source code to the GPU',
+      ],
+      answer: 1,
+      explain: 'Launching is enqueueing. The GPU drains the queue asynchronously.',
+    },
+    {
+      q: 'Which condition is required for cudaMemcpyAsync to overlap with a kernel?',
+      options: ['The kernel must be short', 'The host memory must be pinned', 'Only one stream may exist', 'The GPU must be idle'],
+      answer: 1,
+      explain: 'With pageable memory the copy is staged synchronously through a driver buffer.',
+    },
+    {
+      q: 'Why do serving engines capture decode steps as CUDA Graphs?',
+      options: [
+        'Graphs use less GPU memory',
+        'Replaying a graph avoids per-kernel launch overhead, which can dominate small decode steps',
+        'Graphs make kernels compute faster',
+        'Graphs are required for tensor cores',
+      ],
+      answer: 1,
+      explain: 'Hundreds of tiny kernels per step each pay a few µs of launch cost; a graph replays them with one call.',
+    },
+    {
+      q: 'Three stages take 8, 6 and 8 ms. What is the best possible time with perfect overlap over many chunks?',
+      options: ['22 ms', 'About 8 ms plus fill and drain', '6 ms', '2 ms'],
+      answer: 1,
+      explain: 'A pipeline is limited by its slowest stage; the others hide behind it except at the start and end.',
+    },
+  ]}
+/>

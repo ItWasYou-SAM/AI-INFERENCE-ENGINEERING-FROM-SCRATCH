@@ -53,10 +53,10 @@ _Why the hardware looks the way it does, before writing any CUDA._
 **Sources:** `BGE` (Phase 1, Ch 1–15), `FREGLY` (GPU architecture chapters)
 
 - **2.1** Why CPUs can't have 10,000 cores
-- **2.2** Parallelism and what "parallelizable" means
-- **2.3** Memory bandwidth and the memory hierarchy ✨
+- **2.2** Parallelism and what "parallelizable" means 🟢
+- **2.3** Memory bandwidth and the memory hierarchy 🟢 ✨
 - **2.4** Warps, SIMT and branching ✨
-- **2.5** Occupancy and latency hiding ✨
+- **2.5** Occupancy and latency hiding 🟢 ✨
 - **2.6** The memory wall and HBM
 - **2.7** Thought experiment: designing an LLM processor
 
@@ -85,7 +85,7 @@ _Kernels, threads, blocks and memory: the CUDA programming model._
 - **4.3** Host/device memory and transfers 🔴
 - **4.4** Shared memory and __syncthreads 🔴
 - **4.5** Race conditions and correctness 🔴
-- **4.6** Kernel launch anatomy, async execution and streams ✨
+- **4.6** Kernel launch anatomy, async execution and streams 🔴 ✨
 - **4.7** Coalesced vs strided access 🔴 ✨
 - **4.8** When not to use a GPU
 

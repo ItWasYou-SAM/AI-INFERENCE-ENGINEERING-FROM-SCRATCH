@@ -1,0 +1,143 @@
+---
+summary: A task is parallelizable when its pieces do not wait on each other. This chapter gives you the vocabulary, Amdahl's law to bound the payoff, and a precise answer to which parts of LLM inference parallelize and which never will.
+duration: 15 min
+objectives:
+  - Distinguish data parallelism, task parallelism and pipelines
+  - Spot dependencies that force work to run in order
+  - Use Amdahl's law to bound speedup from a serial fraction
+  - Explain how much parallel work a GPU needs, and where an LLM step finds it
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Work is **parallelizable** when its pieces can run at the same time without waiting on each other's results. The question is never
+"is this program parallel?" but "where are the dependencies?".
+
+## Three kinds of parallelism
+
+- **Data parallelism.** The same operation on many independent items. Adding two vectors: element $i$ never needs element $j$. This is
+  what GPUs are built for.
+- **Task parallelism.** Different operations that do not depend on each other, such as tokenizing one request while another is decoding.
+- **Pipelining.** A chain of stages where each item must pass through in order, but different items can occupy different stages at once,
+  like an assembly line. Pipeline parallelism across GPUs ([14.3](/learn/m14/pipeline-parallelism)) works this way.
+
+## Dependencies
+
+A dependency is any place where one result is needed to compute another. Three patterns come up constantly:
+
+| Pattern | Example | Parallel? |
+|:--|:--|:--|
+| **Map**: each output from its own input | $y_i = \operatorname{SiLU}(x_i)$ | Fully. $n$ items, $n$ workers, one step. |
+| **Reduction**: many inputs into one | $\sum_i x_i$, softmax denominators, dot products | Partly. A tree finishes in $\log_2 n$ steps ([5.1](/learn/m05/reduction-trees)). |
+| **Recurrence**: step $t$ needs step $t-1$ | token $t+1$ needs token $t$ | Not at all, along that chain. |
+
+A matrix multiply is a mix: each of the $M \times N$ outputs is independent (a map), and each output is a dot product (a reduction).
+That gives a lot of parallel work, which is why matmuls run so well on GPUs.
+
+## Amdahl's law
+
+If a fraction $p$ of the work parallelizes perfectly and the rest $1-p$ must run serially, then on $N$ workers the speedup is
+
+$$
+S(N) = \frac{1}{(1-p) + \dfrac{p}{N}} \quad\xrightarrow{\;N \to \infty\;}\quad \frac{1}{1-p}.
+$$
+
+The serial part sets a hard ceiling. From the lab below:
+
+| Parallel fraction $p$ | 64 workers | 1,024 workers | 16,896 workers | Limit |
+|--:|--:|--:|--:|--:|
+| 0.9 | 8.8× | 9.9× | 10.0× | 10× |
+| 0.99 | 39.3× | 91.2× | 99.4× | 100× |
+| 0.999 | 60.2× | 506× | 944× | 1,000× |
+| 0.99999 | 64.0× | 1,014× | 14,454× | 100,000× |
+
+<Callout type="insight">
+  To make good use of an H100's 16,896 FP32 lanes, the serial fraction has to be below about one part in a hundred thousand. In practice
+  that means the GPU should only be given the parallel part, and the serial part should be kept somewhere else or made to overlap with it.
+</Callout>
+
+## How much parallel work is enough?
+
+Lanes are only half the story. To hide memory latency, a GPU needs many more threads *resident* than it has lanes ([2.5](/learn/m02/occupancy-latency-hiding)).
+An H100 can hold 2,048 threads per SM × 132 SMs = **270,336 threads** at once. A kernel that launches fewer than about that many
+threads leaves part of the GPU idle.
+
+Now look at LLM generation:
+
+- **Across decode steps:** a recurrence. Token $t+1$ depends on token $t$. One request's steps can never run in parallel.
+- **Within one step:** about 7.5 billion independent multiply-adds for an 8B model. Plenty.
+- **Across requests:** different users' requests are independent. Putting them in one batch multiplies the work per step.
+
+<Callout type="warning" title="Batch-1 decode is thinner than it looks">
+  A $4096 \times 4096$ weight matrix times one token's vector produces only **4,096** outputs, far fewer than 270K threads. Kernels for
+  this shape split each dot product across many threads (split-K) to find enough parallelism. Batching more requests adds more outputs
+  per weight, and serving engines batch aggressively for exactly that reason ([10.1](/learn/m10/continuous-batching)).
+</Callout>
+
+## Lab: Amdahl in numbers 🟢
+
+```python title="labs/m02/2.2/amdahl.py"
+def amdahl(p: float, n: int) -> float:
+    return 1 / ((1 - p) + p / n)
+```
+
+```bash
+python labs/m02/2.2/amdahl.py
+```
+
+```text title="output (excerpt)"
+ parallel fraction        1        8       64     1024    16896    limit
+               0.9      1.0      4.7      8.8      9.9     10.0       10
+              0.99      1.0      7.5     39.3     91.2     99.4      100
+             0.999      1.0      7.9     60.2    506.2    944.2     1000
+```
+
+<Callout type="note" title="Exercises">
+  1. A request spends 2 ms in Python scheduling and 18 ms in GPU kernels per decode step. If kernels get infinitely fast, what is the best possible speedup? (This is why engines move scheduling off the critical path.)
+  2. **Gustafson's view:** instead of fixing the problem size, grow it with $N$. How does batching in a serving engine fit that view?
+  3. Classify each as map, reduction or recurrence: RMSNorm, the attention softmax, the residual add, the sampling loop.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 1: what parallelizable means, dependencies, and Amdahl's law." />
+  <SourceCard id="FREGLY" note="GPU architecture chapters: how many threads a GPU needs in flight." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Which of these is a recurrence that cannot be parallelized along its chain?',
+      options: ['Adding two vectors', 'Summing a vector', 'Generating tokens for one request', 'Multiplying two matrices'],
+      answer: 2,
+      explain: 'Each new token is an input to the next step, so the steps must run in order.',
+    },
+    {
+      q: '95% of a program parallelizes perfectly. What is the maximum speedup on unlimited workers?',
+      options: ['5×', '20×', '95×', 'Unlimited'],
+      answer: 1,
+      explain: '1 / (1 − 0.95) = 20×. The 5% serial part sets the ceiling.',
+    },
+    {
+      q: 'How many steps does a tree reduction of 1,024 numbers take with enough workers?',
+      options: ['1', '10', '512', '1,024'],
+      answer: 1,
+      explain: 'Each step halves the count: log₂(1024) = 10 steps.',
+    },
+    {
+      q: 'Why does batching requests help decode use a GPU?',
+      options: [
+        'It makes each request\'s steps independent',
+        'It adds independent outputs to each step, giving the GPU more parallel work per weight it loads',
+        'It reduces the number of layers',
+        'It shortens the KV cache',
+      ],
+      answer: 1,
+      explain: 'Different requests are independent, so a batch multiplies the parallel work in each step without breaking the per-request recurrence.',
+    },
+  ]}
+/>

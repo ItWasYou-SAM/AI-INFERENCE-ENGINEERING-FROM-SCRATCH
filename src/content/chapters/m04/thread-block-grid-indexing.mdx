@@ -1,0 +1,152 @@
+---
+summary: Every thread needs to know which piece of data is its own. CUDA arranges threads into blocks and blocks into a grid, in up to three dimensions, and one line of arithmetic turns those coordinates into an array index.
+duration: 20 min
+objectives:
+  - Compute a thread's global index in 1D and 2D launches
+  - Size a grid with round-up division and guard the tail
+  - Write a grid-stride loop that handles any problem size
+  - Map threads to a row-major matrix so that warps read adjacent memory
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import ThreadIndexing from '../../../components/viz/ThreadIndexing.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+A launch creates a **grid** of **blocks**, each a group of **threads** ([4.1](/learn/m04/kernels-are-not-functions)). Inside the kernel, four
+built-in variables describe where a thread sits:
+
+| Variable | Meaning | Type |
+|:--|:--|:--|
+| `threadIdx` | this thread's position inside its block | `uint3` (x, y, z) |
+| `blockIdx` | this block's position inside the grid | `uint3` |
+| `blockDim` | threads per block in each dimension | `dim3` |
+| `gridDim` | blocks per grid in each dimension | `dim3` |
+
+## The 1D formula
+
+$$
+i = \texttt{blockIdx.x} \times \texttt{blockDim.x} + \texttt{threadIdx.x}
+$$
+
+Block 0 covers indices $0 \dots \texttt{blockDim}-1$, block 1 the next stretch, and so on. To cover $n$ elements you need
+$\lceil n / \texttt{blockDim} \rceil$ blocks, which is usually written `(n + threads - 1) / threads`. The last block is usually only partly
+needed, so every kernel guards with `if (i < n)`.
+
+<Figure label="fig. 4.2" caption="How thread coordinates become array indices. In 1D, click a thread or an element and change the block size and array length. In 2D, click any cell of the matrix to see its block, thread, row, column and linear index.">
+  <ThreadIndexing client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Set n = 22 with blocks of 8. Three blocks are launched (24 threads), and threads 22 and 23 must be stopped by the guard.
+  2. Switch to **2D** and click cell 36. Work out row and column yourself before reading the answer.
+  3. In 2D, change blockDim.x from 4 to 8. The same cell now belongs to a different block, and its index is unchanged.
+</Callout>
+
+## Grid-stride loops
+
+Instead of launching one thread per element, you can launch a fixed grid (a few blocks per SM) and let each thread walk through the array:
+
+```cpp title="labs/m04/4.2/indexing.cu"
+__global__ void scale(float* x, float s, int n) {
+    int stride = gridDim.x * blockDim.x;                  // total threads in the grid
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
+        x[i] *= s;
+}
+```
+
+The same launch works for any $n$, and each thread amortizes its setup over several elements. In the lab, 20,480 threads correctly cover 10
+million elements.
+
+## Two dimensions
+
+For matrices and images, 2D blocks are more natural. With a row-major matrix (element $(r, c)$ at `r * cols + c`):
+
+```cpp
+int col = blockIdx.x * blockDim.x + threadIdx.x;   // x -> columns
+int row = blockIdx.y * blockDim.y + threadIdx.y;   // y -> rows
+if (row < rows && col < cols) c[row * cols + col] = a[row * cols + col] + b[row * cols + col];
+```
+
+<Callout type="warning" title="Put x on the contiguous dimension">
+  Threads are grouped into warps along `threadIdx.x` first. Mapping `x` to columns means the 32 threads of a warp read 32 adjacent floats in
+  one row, which the hardware serves in a few wide transactions. Swap the mapping and each warp reads down a column, touching 32 different
+  rows: often several times slower ([4.7](/learn/m04/coalesced-vs-strided)).
+</Callout>
+
+## Choosing a block size
+
+- Make it a **multiple of 32** (the warp size), or the last warp in each block runs partly empty.
+- **128–256 threads** is a good default. It gives the scheduler several warps per block without hitting resource limits ([2.5](/learn/m02/occupancy-latency-hiding)).
+- The hard limits: 1,024 threads per block; grid up to $2^{31}-1$ blocks in x and 65,535 in y and z.
+
+In LLM kernels, the grid usually mirrors the data: one block per token row for RMSNorm, a grid of (heads × batch) blocks for decode
+attention, a 2D grid of output tiles for a matmul.
+
+## Lab: indexing in practice 🔴
+
+```bash
+cd labs/m04/4.2 && nvcc -O2 -arch=native indexing.cu -o indexing && ./indexing
+```
+
+```text title="output (excerpt)"
+1) i = blockIdx.x * blockDim.x + threadIdx.x  (3 blocks x 4 threads)
+  i= 0  <- block 0, thread 0
+  ...
+  i= 4  <- block 1, thread 0
+  ...
+  i=11  <- block 2, thread 3
+
+2) grid-stride: 20480 threads covered 10000000 elements: PASS
+
+3) 2D: grid (157, 375) of blocks (32, 8) = 15072000 threads for 15000000 elements: PASS
+```
+
+<Callout type="note" title="Exercises">
+  1. In part 3, 72,000 threads have nothing to do. Where are they, and which guard stops them?
+  2. Rewrite `mat_add` as a 1D kernel over all `rows × cols` elements. Is it any slower?
+  3. Swap the x/y mapping in `mat_add` (x → rows). Time both versions with `GpuTimer` and compare.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 2: threads, blocks, grids and indexing." />
+  <SourceCard id="CUDA100" note="Days 1–7: 1D and 2D indexing, matrix add and grid-stride loops." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'blockDim.x = 128. What is the global index of thread 5 in block 3?',
+      options: ['8', '389', '384', '133'],
+      answer: 1,
+      explain: '3 × 128 + 5 = 389.',
+    },
+    {
+      q: 'How many 256-thread blocks do you need for n = 1,000 elements?',
+      options: ['3', '4', '5', '1,000'],
+      answer: 1,
+      explain: '(1000 + 255) / 256 = 4 in integer division. The last block has 24 surplus threads, stopped by the guard.',
+    },
+    {
+      q: 'What is the advantage of a grid-stride loop?',
+      options: [
+        'It avoids the need for a guard',
+        'One fixed-size launch handles any n, and each thread amortizes setup over several elements',
+        'It makes blocks run in order',
+        'It uses shared memory automatically',
+      ],
+      answer: 1,
+      explain: 'The loop condition i < n is the guard, and the grid size no longer depends on the data size.',
+    },
+    {
+      q: 'For a row-major matrix, which dimension should threadIdx.x map to?',
+      options: ['Rows', 'Columns', 'It makes no difference', 'Whichever is larger'],
+      answer: 1,
+      explain: 'Columns are contiguous in row-major layout, so a warp along x reads adjacent addresses.',
+    },
+  ]}
+/>

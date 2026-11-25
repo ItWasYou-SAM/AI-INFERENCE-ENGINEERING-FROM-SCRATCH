@@ -1,0 +1,186 @@
+---
+summary: Put the whole module together in about 150 lines of NumPy. You build a complete GPT-style decoder, generate with and without a KV cache, and check that the cached loop produces the same tokens much faster.
+duration: 35 min
+objectives:
+  - Implement a decoder-only transformer forward pass from scratch
+  - Write a naive generation loop and a prefill-plus-decode loop with a KV cache
+  - Verify that both loops produce identical tokens
+  - Measure the speedup and the cache's memory, and explain both
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+This lab is the module in one file: `labs/m01/1.6/tiny_gpt.py` builds the model from [1.1](/learn/m01/tokens-embeddings-logits)–[1.3](/learn/m01/attention-step-by-step),
+runs the loop from [1.4](/learn/m01/autoregressive-generation), and adds the cache from [1.5](/learn/m01/why-kv-cache). It needs only
+NumPy and runs on any laptop.
+
+```bash
+python labs/m01/1.6/tiny_gpt.py
+```
+
+## The model
+
+A 4-layer, 128-wide decoder with 4 heads and a byte-level vocabulary of 256: about 0.9 M parameters. The weights are **random**, so
+the output is gibberish. That is fine, because this lab is about the mechanics, and mechanics are easier to check when nothing is hidden
+inside a trained checkpoint.
+
+The forward pass is the layer from [1.2](/learn/m01/inside-a-transformer-layer), written out:
+
+```python title="labs/m01/1.6/tiny_gpt.py"
+def forward(w, cfg, tokens, start_pos=0, cache=None):
+    x = w["tok_emb"][tokens] + w["pos_emb"][start_pos:start_pos + len(tokens)]
+
+    for i, layer in enumerate(w["layers"]):
+        h = rms_norm(x, layer["norm1"])
+        q, k, v = np.split(h @ layer["w_qkv"], 3, axis=-1)
+        q, k, v = (split_heads(t, cfg.n_heads) for t in (q, k, v))
+        if cache is not None:                      # append new K/V, attend over all of it
+            c = cache[i]
+            c["k"] = k if c["k"] is None else np.concatenate([c["k"], k], axis=1)
+            c["v"] = v if c["v"] is None else np.concatenate([c["v"], v], axis=1)
+            k, v = c["k"], c["v"]
+        x = x + merge_heads(attention(q, k, v, start_pos)) @ layer["w_o"]
+        x = x + gelu(rms_norm(x, layer["norm2"]) @ layer["w_up"]) @ layer["w_down"]
+
+    return rms_norm(x, w["norm_f"]) @ w["tok_emb"].T   # tied LM head
+```
+
+Two details are easy to get wrong:
+
+- **Positions.** With a cache, the new token is at position `start_pos`, not 0. Both the positional embedding and the causal mask need it.
+- **The mask with a cache.** Queries now cover positions `start_pos … start_pos + Tq − 1`, while keys cover `0 … Tk − 1`. The mask
+  compares absolute positions:
+
+```python
+q_pos = q_offset + np.arange(Tq)[:, None]
+k_pos = np.arange(Tk)[None, :]
+scores = np.where(k_pos <= q_pos, scores, -np.inf)
+```
+
+During decode `Tq = 1` and the query is the last position, so the mask allows everything. During prefill it is the usual triangle.
+
+## Two loops
+
+```python
+def generate_naive(w, cfg, prompt, n_new):
+    tokens = list(prompt)
+    for _ in range(n_new):
+        logits = forward(w, cfg, np.array(tokens))          # the whole sequence, every step
+        tokens.append(int(logits[-1].argmax()))
+    return tokens[len(prompt):]
+
+def generate_cached(w, cfg, prompt, n_new):
+    cache = [{"k": None, "v": None} for _ in range(cfg.n_layers)]
+    logits = forward(w, cfg, np.array(prompt), 0, cache)    # prefill
+    out = [int(logits[-1].argmax())]
+    for _ in range(n_new - 1):                              # decode, one token at a time
+        pos = len(prompt) + len(out) - 1
+        logits = forward(w, cfg, np.array([out[-1]]), pos, cache)
+        out.append(int(logits[-1].argmax()))
+    return out
+```
+
+Both use greedy decoding, so if the cache is correct they must agree token for token.
+
+## Results
+
+```text title="output (one laptop; your timings will differ)"
+tiny GPT: 4 layers, d_model 128, 4 heads, 0.89M params
+prompt: 27 tokens, generating 100 greedy tokens
+
+naive    (recompute everything):   7077.0 ms
+kv-cache (prefill + decode)    :    185.6 ms   -> 38.1x faster
+same tokens: True
+KV cache at the end: 882 KiB = 2 (K,V) x 4 layers x 126 positions x 128 dims x 4 bytes
+first 16 generated ids: [101, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47]
+```
+
+- **`same tokens: True`** is the important line. A cache that changes the output is a bug, not an optimization.
+- **The speedup** grows with length. The naive loop pushes about $n_{\text{prompt}} n_{\text{new}} + \tfrac{1}{2}n_{\text{new}}^2$ token-rows through the model in
+  total; the cached loop pushes $n_{\text{prompt}} + n_{\text{new}}$. The measured ratio is lower than the FLOP ratio because, at this tiny size,
+  Python and NumPy call overhead per step is a big part of the cost. Real engines have the same problem, which is why they use CUDA Graphs
+  ([8.7](/learn/m08/torch-compile-cuda-graphs)).
+- **The repeated token `47`** (`/`) is what greedy decoding does with random weights: it falls into a loop. A trained model is less prone to
+  this, but greedy repetition is real, and it is one reason for the sampling methods in [Module 11](/learn/m11/sampling-strategies).
+
+<Callout type="warning" title="If your naive run takes many seconds">
+  The timings above came from a NumPy build linked against a slow reference BLAS. With the OpenBLAS that `pip install numpy` ships, both
+  loops run several times faster. Only the ratio matters here. If the naive loop is painfully slow, lower `n_new`.
+</Callout>
+
+<Callout type="insight" title="What you just built">
+  Every serving engine has these two functions at its core. vLLM and SGLang add a great deal around them: batching many requests into one
+  forward pass, storing the cache in fixed-size pages instead of growing arrays, and running the whole thing on a GPU. But the contract is
+  the one you checked here: prefill fills the cache, decode appends one row per step, and the output must not change.
+</Callout>
+
+## Exercises
+
+<Callout type="note" title="Exercises">
+  1. **Batch it.** Change `generate_cached` to take two prompts of equal length and run them in one forward pass with a leading batch dimension.
+     Does the time per step double?
+  2. **Pre-allocate.** `np.concatenate` copies the whole cache every step, which is $O(n)$ per step and $O(n^2)$ overall. Allocate
+     `[n_heads, max_seq, d_head]` buffers up front and write into them instead. Measure the difference at `n_new = 400`.
+     (This is the problem [PagedAttention](/learn/m09/paged-attention) solves on GPUs.)
+  3. **Count bytes.** For each decode step, add up the bytes of weights and cache that `forward` reads. Plot bytes per step against step number. Which term grows?
+  4. **Sample.** Replace `argmax` with temperature sampling from [1.4](/learn/m01/autoregressive-generation), using a shared seeded RNG. Do the two loops still agree?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="MOHITH" note="The full pipeline this lab implements: embeddings, layers, KV cache, prefill and decode." />
+  <SourceCard id="CUDA100" note="Days 14, 28 and 31 implement the same building blocks as CUDA kernels." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why must the naive and cached loops produce identical tokens under greedy decoding?',
+      options: [
+        'Because the weights are random',
+        'Because the cache only avoids recomputing values that would come out the same, so the logits are unchanged',
+        'Because greedy decoding ignores the logits',
+        'They do not need to match',
+      ],
+      answer: 1,
+      explain: 'The cache stores exactly what the naive loop recomputes. Any difference in output means the cache, positions or mask are wrong.',
+    },
+    {
+      q: 'In the cached decode step, why is start_pos passed to forward?',
+      options: [
+        'To choose the batch size',
+        'So the new token gets the right positional embedding and the causal mask compares the right absolute positions',
+        'To select which layer to run',
+        'It is only used for logging',
+      ],
+      answer: 1,
+      explain: 'The single new token sits at position start_pos. Using position 0 would give it the wrong embedding and the wrong mask.',
+    },
+    {
+      q: 'Why is the measured speedup lower than the FLOP ratio at this model size?',
+      options: [
+        'The cache is slower to read than to recompute',
+        'Per-step Python and library overhead is a large share of each tiny step',
+        'NumPy does not support attention',
+        'The prompt is too long',
+      ],
+      answer: 1,
+      explain: 'With a 0.9 M-parameter model, each step does very little math, so fixed per-call overhead dominates. Real engines fight the same overhead with CUDA Graphs.',
+    },
+    {
+      q: 'What is the problem with growing the cache using np.concatenate?',
+      options: [
+        'It changes the values',
+        'It copies the whole cache each step, adding O(n) work per step',
+        'It only works for one layer',
+        'It uses too few bytes',
+      ],
+      answer: 1,
+      explain: 'Concatenation allocates a new array and copies everything into it. Pre-allocated or paged buffers avoid the copy.',
+    },
+  ]}
+/>

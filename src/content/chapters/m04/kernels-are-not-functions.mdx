@@ -1,0 +1,184 @@
+---
+summary: A CUDA kernel looks like a C++ function, but calling it starts thousands of copies at once, returns before any of them has run, gives nothing back, and can't see your CPU's memory. Get these four differences right and the rest of CUDA follows.
+duration: 20 min
+objectives:
+  - Write, launch and error-check a CUDA kernel
+  - Explain the four ways a kernel differs from a normal function
+  - Show that kernel launches are asynchronous, and synchronize correctly
+  - Build and run a checked vector add on a GPU or on Colab
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Here is a complete CUDA kernel:
+
+```cpp
+__global__ void vector_add(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = a[i] + b[i];
+}
+```
+
+And here is how you call it:
+
+```cpp
+vector_add<<<blocks, threads>>>(a, b, c, n);
+```
+
+It looks like a function call with some odd brackets. It isn't. Four things are different.
+
+## 1. One call, many copies
+
+`<<<blocks, threads>>>` is the **launch configuration**. The call runs the kernel body `blocks × threads` times, once per **thread**, all
+at the same time on the GPU's cores. With 262,144 blocks of 256 threads, that is 67 million copies of the two lines above.
+
+Each copy finds out which one it is from built-in variables: `blockIdx` (which block), `threadIdx` (which thread inside the block) and
+`blockDim` (threads per block). From those it computes which element to work on. Chapter [4.2](/learn/m04/thread-block-grid-indexing)
+covers indexing in full.
+
+<Callout type="insight">
+  You write the code for **one** thread, and the hardware runs it for all of them. There's no loop over elements: the launch is the loop.
+  This is the data parallelism from [2.2](/learn/m02/what-parallelizable-means), expressed directly.
+</Callout>
+
+## 2. It returns before it runs
+
+A launch only **enqueues** the work. The CPU gets control back after a few microseconds, while the GPU may not have started yet. From the lab:
+
+```text
+2) launches are asynchronous
+  launch call returned after      4.6 us
+  kernel finished after        5060.9 us
+```
+
+To wait for the GPU, call `cudaDeviceSynchronize()`, or do something that implicitly waits, such as copying the result back with
+`cudaMemcpy`. Forgetting this is the most common source of "my kernel takes 0 ms" benchmarks. Chapter
+[4.6](/learn/m04/launch-async-streams) shows how to use this asynchrony on purpose.
+
+## 3. No return value, and errors arrive late
+
+A kernel's return type is always `void`. Results are written to memory through pointers. Errors don't come back from the launch either:
+
+- A bad launch configuration (say, 2,000 threads per block, over the 1,024 limit) is reported by `cudaGetLastError()` right after the launch.
+- A fault *inside* the kernel, such as an out-of-bounds write, shows up at the next synchronizing call, possibly far away in your code.
+
+So every lab here wraps API calls in a checking macro:
+
+```cpp title="labs/m04/common.cuh"
+#define CUDA_CHECK(call)                                                   \
+    do {                                                                   \
+        cudaError_t err_ = (call);                                         \
+        if (err_ != cudaSuccess) {                                         \
+            fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #call,         \
+                    __FILE__, __LINE__, cudaGetErrorString(err_));         \
+            exit(1);                                                       \
+        }                                                                  \
+    } while (0)
+```
+
+## 4. It lives in a different memory
+
+On a discrete GPU, the kernel can only touch **device memory** (the GPU's HBM or GDDR). Pointers from `malloc` or `new` point into CPU
+memory, and dereferencing them in a kernel is an error. You allocate device memory with `cudaMalloc` and move data with `cudaMemcpy`
+([4.3](/learn/m04/host-device-memory)).
+
+<Callout type="warning" title="Blocks run in any order">
+  The lab launches `hello<<<3, 32>>>` and prints from each block. On our run the order came out 0, 2, 1. There is no guaranteed order between
+  blocks, and no way for blocks to wait for each other inside one kernel. If block 5 needs block 4's result, they must be in separate kernel
+  launches (or use advanced features like cooperative groups). Threads *within* a block can coordinate ([4.4](/learn/m04/shared-memory-syncthreads)).
+</Callout>
+
+## The qualifiers
+
+| Qualifier | Runs on | Called from |
+|:--|:--|:--|
+| `__global__` | GPU | CPU (a launch), returns `void` |
+| `__device__` | GPU | GPU code only: a normal helper function |
+| `__host__` | CPU | CPU (the default for ordinary functions) |
+
+## Lab: your first kernel 🔴
+
+Every Module 4 lab is a single `.cu` file. On your own NVIDIA GPU, or on Colab with a free T4 (see `labs/m04/README.md`):
+
+```bash
+cd labs/m04/4.1
+nvcc -O2 -arch=native vector_add.cu -o vector_add && ./vector_add
+```
+
+```text title="output (RTX 3050 6GB Laptop)"
+GPU: NVIDIA GeForce RTX 3050 6GB Laptop GPU (sm_86, 20 SMs)
+
+1) hello<<<3, 32>>>: blocks run in any order
+  hello from block 0, thread 0
+  hello from block 0, thread 1
+  hello from block 2, thread 0
+  hello from block 2, thread 1
+  hello from block 1, thread 0
+  hello from block 1, thread 1
+
+2) launches are asynchronous
+  launch call returned after      4.6 us
+  kernel finished after        5060.9 us
+
+3) vector add, 67108864 elements, 262144 blocks x 256 threads
+  kernel time 5.073 ms -> 159 GB/s (3 x 256 MB moved)
+  check against CPU: PASS
+```
+
+The vector add moved 768 MB in 5.1 ms, which is **159 GB/s**, about 95% of this laptop GPU's ~168 GB/s spec. With 1 FLOP per 12 bytes it is
+completely memory-bound ([3.1](/learn/m03/compute-vs-memory-bound)), and reaching 95% of bandwidth is as good as it gets.
+
+<Callout type="note" title="Exercises">
+  1. Remove the `if (i < n)` guard and set `n` to a number that is not a multiple of 256. Run under `compute-sanitizer ./vector_add`. What does it report?
+  2. Launch with 2,048 threads per block. Where does the error appear, and what does it say?
+  3. Time the vector add with `std::chrono` around the launch but **without** synchronizing. What number do you get, and why is it wrong?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 2: kernels, launches and the CUDA execution model." />
+  <SourceCard id="CUDA100" note="Days 1–7: vector add, the first kernels and error checking." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'How many times does the body of kernel<<<100, 128>>>(...) run?',
+      options: ['1', '100', '128', '12,800'],
+      answer: 3,
+      explain: 'Once per thread: 100 blocks × 128 threads = 12,800.',
+    },
+    {
+      q: 'What happens when the CPU launches a kernel?',
+      options: [
+        'The CPU waits until the kernel finishes',
+        'The work is enqueued and the CPU continues immediately',
+        'The kernel runs on the CPU first',
+        'The GPU copies all CPU memory',
+      ],
+      answer: 1,
+      explain: 'Launches are asynchronous. Use cudaDeviceSynchronize or a synchronizing copy to wait.',
+    },
+    {
+      q: 'How does a kernel give back its result?',
+      options: ['Through its return value', 'By writing to device memory through a pointer', 'Through printf', 'Through a global CPU variable'],
+      answer: 1,
+      explain: 'Kernels return void. They write results to device memory, which the host then copies back.',
+    },
+    {
+      q: 'Block 7 needs a value computed by block 3 of the same kernel. What is the correct approach?',
+      options: [
+        'Use __syncthreads()',
+        'Have block 7 spin until the value appears',
+        'Split the work into two kernel launches',
+        'Launch blocks in order with a special flag',
+      ],
+      answer: 2,
+      explain: 'Blocks run in no guaranteed order and cannot wait for each other. A kernel boundary is the global synchronization point.',
+    },
+  ]}
+/>

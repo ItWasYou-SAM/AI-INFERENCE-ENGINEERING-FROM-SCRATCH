@@ -1,0 +1,132 @@
+---
+summary: A request runs as one big compute-bound prefill followed by many small memory-bound decode steps. The first sets time to first token, the second sets time per output token, and the two pull a serving engine in opposite directions.
+duration: 20 min
+objectives:
+  - Predict TTFT and TPOT for a model, GPU and request shape from roofline arithmetic
+  - Explain why prefill is compute-bound and decode is memory-bound
+  - Show how batching trades per-user TPOT for total throughput
+  - Explain why prefill and decode interfere when they share a GPU
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import PrefillDecodeTimeline from '../../../components/viz/PrefillDecodeTimeline.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+You met the two phases in [0.2](/learn/m00/life-of-a-request) and [1.4](/learn/m01/autoregressive-generation). With arithmetic intensity
+([3.2](/learn/m03/arithmetic-intensity)) you can now predict how long each one takes.
+
+## Two phases, two limits
+
+**Prefill** runs all $T$ prompt tokens through the model at once. Every weight matmul has $M = T$ rows, so its intensity is in the
+hundreds or thousands: **compute-bound**. Its time is about
+
+$$
+\text{TTFT} \approx \frac{2N \cdot T + \text{attention}}{P_{\text{peak}}}
+$$
+
+**Decode** runs one new token per sequence. At batch $b$, matmul intensity is about $b$, and attention intensity is about 1–8 regardless of
+batch. Unless $b$ is in the hundreds, it is **memory-bound**:
+
+$$
+\text{TPOT} \approx \frac{\text{weight bytes} + b \times \text{KV bytes per sequence}}{B_{\text{HBM}}}
+$$
+
+For Llama-3-8B on an H100, a 2,048-token prompt and 256 output tokens, the roofline gives **TTFT ≈ 30 ms** and **TPOT ≈ 4.6 ms**. The whole
+answer takes about 1.2 s, and 97% of it is decode.
+
+<Figure label="fig. 3.4" caption="One request on one GPU, from roofline arithmetic. Change the prompt, the answer length, the number of users decoding together, the model and the GPU, and watch TTFT, TPOT and throughput move.">
+  <PrefillDecodeTimeline client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Switch the GPU from **H100** to **H200**. TTFT hardly changes (same compute), while TPOT drops by about 30% (more bandwidth).
+  2. Raise **concurrent users** from 1 to 64 on Llama-3-8B. TPOT roughly doubles, from 4.6 to 10 ms, but total throughput rises from about 220 to 6,400 tokens/s.
+  3. Do the same with **Llama-2-7B**. At 64 users TPOT reaches about 26 ms: without grouped-query attention, the per-user KV cache is four times larger, and reading it dominates the step.
+  4. Raise the prompt from 512 to 8,192 tokens. TTFT grows from about 8 ms to 134 ms: faster than linear, because attention cost grows with $T^2$.
+</Callout>
+
+## Batching: the central trade
+
+Decode at batch 1 wastes almost all of the GPU's arithmetic. Adding sequences to a step reuses the weights already being loaded, so
+throughput rises nearly in proportion while TPOT grows slowly, until the KV cache reads take over. That gives every serving engine its core
+dial:
+
+- **Small batches:** fast tokens for each user, expensive per token.
+- **Large batches:** cheap tokens, slower for each user, and more memory spent on KV cache.
+
+The right setting depends on what users were promised: a **service-level objective** (SLO) such as "TTFT under 500 ms and TPOT under 50 ms
+at the 99th percentile". Chapters [13.1](/learn/m13/serving-metrics) and [16.2](/learn/m16/slos-goodput) turn that into numbers you can measure.
+
+## Why the phases interfere
+
+A serving engine runs both phases for different users on the same GPU. When a new request's prefill enters a step, that step becomes
+compute-bound and much longer, and **every user in the decode batch waits** for it. A 30 ms prefill inserted into a stream of 5 ms decode
+steps is a visible stutter for everyone.
+
+<Callout type="insight" title="This conflict shapes modern serving">
+  Engines answer it in two ways. **Chunked prefill** splits long prompts into pieces and mixes them into decode steps, so no single step
+  gets too long ([10.3](/learn/m10/chunked-prefill)). **Disaggregated serving** runs prefill and decode on separate GPUs, each configured for
+  its own limit, and transfers the KV cache between them ([15.1](/learn/m15/why-disaggregate)).
+</Callout>
+
+<Callout type="note" title="Exercises">
+  1. With TTFT 30 ms and TPOT 4.6 ms, how long does a 1,000-token answer take? What fraction is prefill?
+  2. A chat service promises TPOT under 20 ms. Using the figure, what is the largest batch Llama-3-8B can serve on an H100 at a 2K context? On an A100?
+  3. A RAG app sends 16K-token prompts and gets 100-token answers. Which phase dominates now, and which GPU spec matters most?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="MOHITH" note="The two phases of inference: prefill sets TTFT, decode sets TPOT." />
+  <SourceCard id="TTFT" note="Week 1: deriving TTFT and TPOT from hardware numbers, and measuring them in later weeks." />
+  <SourceCard id="BGE" note="Ch 33–35: compute and bandwidth ceilings applied to the two phases." />
+  <SourceCard id="FREGLY" note="Arithmetic-intensity chapter: why the same model behaves so differently in each phase." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Which GPU spec most affects TPOT at small batch sizes?',
+      options: ['Peak FLOP/s', 'Memory bandwidth', 'Number of SMs', 'PCIe bandwidth'],
+      answer: 1,
+      explain: 'Decode is memory-bound: each step reads the weights and KV cache, so TPOT ≈ bytes ÷ bandwidth.',
+    },
+    {
+      q: 'Why is prefill compute-bound?',
+      options: [
+        'It reads the KV cache many times',
+        'All prompt tokens go through each weight matmul together, so each weight is reused T times',
+        'It runs on tensor cores only',
+        'It skips attention',
+      ],
+      answer: 1,
+      explain: 'Matmul intensity ≈ tokens per step. With thousands of prompt tokens, intensity is far above the ridge point.',
+    },
+    {
+      q: 'Going from batch 1 to batch 64 in decode usually…',
+      options: [
+        'Raises total throughput a lot and raises TPOT a little',
+        'Lowers both throughput and TPOT',
+        'Leaves throughput unchanged',
+        'Makes decode compute-bound immediately',
+      ],
+      answer: 0,
+      explain: 'The weight reads are shared by all 64 sequences, so tokens per second rise far faster than step time.',
+    },
+    {
+      q: 'Why can a new request\'s prefill hurt other users\' TPOT?',
+      options: [
+        'It deletes their KV cache',
+        'It shares the step with their decode, making that step much longer',
+        'It changes their sampling temperature',
+        'It uses a different model',
+      ],
+      answer: 1,
+      explain: 'All sequences in a step finish together. A long compute-bound prefill delays every decode token in that step.',
+    },
+  ]}
+/>
