@@ -1,0 +1,172 @@
+---
+summary: "Matrix multiplication is most of an LLM's FLOPs, and the gap between a naive kernel and cuBLAS is 60×. This chapter closes the first part of that gap: fix the access pattern, then stage tiles in shared memory so each value loaded from memory is used many times. It also shows why the second step helps less than you might expect."
+duration: 30 min
+objectives:
+  - Explain why GEMM dominates LLM inference, and compute its FLOPs and minimum memory traffic
+  - Map threads to outputs so that global memory accesses coalesce
+  - Write a shared-memory tiled matmul, and derive how tiling raises arithmetic intensity
+  - Measure each version against cuBLAS and explain what still limits the tiled kernel
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import TiledMatmul from '../../../components/viz/TiledMatmul.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Every linear layer in a transformer is a matrix multiplication: Q, K, V and output projections, and the two or three matrices of the MLP
+([1.2](/learn/m01/inside-a-transformer-layer)). In prefill, these **GEMMs** (general matrix multiplies) are more than 90% of the FLOPs. In
+decode they shrink to matrix-vector products, but batching turns them back into skinny GEMMs ([3.4](/learn/m03/prefill-vs-decode)). If you
+make one kernel fast, make it this one.
+
+## The arithmetic
+
+$C = A \times B$ with $A$ of size $M \times K$ and $B$ of size $K \times N$. Each of the $M N$ outputs is a dot product of length $K$:
+
+$$
+\text{FLOPs} = 2MNK, \qquad \text{minimum bytes} = 4(MK + KN + MN) \ \text{(FP32)}
+$$
+
+For $M = N = K = 4096$, that is 137 GFLOP against 201 MB: **683 FLOP per byte**. A GEMM this size is deeply compute-bound
+([3.2](/learn/m03/arithmetic-intensity)), *if* each input is read from memory only once. Each element of $A$ is used by $N$ different
+outputs. The whole game is making those $N$ uses cost one load from memory, not $N$.
+
+## Version 1: naive
+
+One thread per output, a loop over $k$:
+
+```cpp
+int row = blockIdx.x * blockDim.x + threadIdx.x;     // x → row
+int col = blockIdx.y * blockDim.y + threadIdx.y;
+float acc = 0.0f;
+for (int k = 0; k < N; k++) acc += A[row * N + k] * B[k * N + col];
+C[row * N + col] = acc;
+```
+
+It's correct and it's slow. The 32 threads of a warp differ in `threadIdx.x`, so they have **different rows** and the same column. At each
+`k`, the warp reads 32 elements of $A$ that are $N$ floats apart: 32 separate sectors for 128 useful bytes
+([4.7](/learn/m04/coalesced-vs-strided)). The writes to $C$ are strided the same way.
+
+## Version 2: coalesced
+
+Swap the mapping. If `threadIdx.x` picks the **column**, a warp shares one row: at each `k` it reads a single element of $A$ (broadcast to
+all 32 lanes) and 32 *adjacent* elements of $B$, one coalesced 128-byte load. Nothing else changes.
+
+## Version 3: shared-memory tiles
+
+Even coalesced, the kernel loads every element of $A$ and $B$ from global memory $N$ times. The caches absorb part of it, but every
+load is still an instruction and a trip through the memory pipeline.
+
+Tiling makes the reuse explicit. A block of $32 \times 32$ threads computes a $32 \times 32$ tile of $C$. It walks along $k$ in steps of 32.
+At each step it loads one $32 \times 32$ tile of $A$ and one of $B$ into shared memory ([4.4](/learn/m04/shared-memory-syncthreads)), then
+every thread does 32 multiply-adds from shared memory:
+
+```cpp
+// labs/m06/6.1/matmul.cu
+__shared__ float As[32][32], Bs[32][32];
+for (int k0 = 0; k0 < N; k0 += 32) {
+    As[ty][tx] = A[row * N + k0 + tx];        // each thread loads one element of each tile
+    Bs[ty][tx] = B[(k0 + ty) * N + col];
+    __syncthreads();                          // tiles complete before anyone reads them
+    for (int k = 0; k < 32; k++) acc += As[ty][k] * Bs[k][tx];
+    __syncthreads();                          // everyone done before the tiles are overwritten
+}
+```
+
+<Figure label="fig. 6.1" caption="One block computing one tile of C (violet). At each k-step it needs a tile of A (amber) and a tile of B (blue); faded cells are tiles already used. Compare memory loads with and without shared-memory tiles, for different tile sizes.">
+  <TiledMatmul client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. In **tiled** mode, step through all the k-steps for a 4×4 tile. Then switch to **one output per thread** and compare the loads. The ratio is the tile width.
+  2. Try an 8×8 tile. The intensity doubles. What limits how large a real tile can be? (Hint: 32 × 32 floats × 2 tiles is already 8 KB of shared memory per block, and 6.2 adds registers.)
+</Callout>
+
+Each element loaded into shared memory is used by 32 threads, so global traffic falls **32×**. The intensity of the inner loop rises from
+0.25 to $T / 4$ FLOP per byte of global memory, 8 for $T = 32$.
+
+## Measured
+
+```text title="output (RTX 3050 6GB Laptop)"
+C = A * B, 4096 x 4096 FP32 (137.4 GFLOP):
+  kernel             time      GFLOP/s  of cuBLAS  max |error|
+  naive        1821.42 ms           75       1.7%      3.5e-04 PASS
+  coalesced     256.99 ms          535      11.9%      3.5e-04 PASS
+  tiled         203.87 ms          674      15.0%      3.5e-04 PASS
+  cuBLAS         30.55 ms         4498     100.0%
+```
+
+- **Coalescing: 7.1×.** One changed line, the biggest win in the chapter.
+- **Tiling: only 1.26× more.** On this GPU, the 128 KB L1 cache per SM already catches most of the coalesced kernel's repeated loads, so
+  making the reuse explicit buys less than the 32× drop in traffic suggests.
+- **Still 6.7× slower than cuBLAS.** The tiled kernel is no longer limited by DRAM. It is limited by **shared memory**: every FMA needs
+  two shared-memory loads (`As[ty][k]` and `Bs[k][tx]`), and an SM can't issue loads as fast as it can issue FMAs. Moving the bottleneck from
+  DRAM to shared memory to registers is exactly what the next chapter does.
+
+<Callout type="insight" title="GEMM optimization is a ladder of reuse">
+  Each level of the memory hierarchy ([2.3](/learn/m02/bandwidth-and-memory-hierarchy)) gets its own tile. Thread-block tiles in shared memory
+  cut DRAM traffic, per-thread tiles in registers cut shared-memory traffic ([6.2](/learn/m06/register-tiling)), and tensor cores consume
+  whole fragments per instruction ([6.7](/learn/m06/tensor-cores-mixed-precision)). FlashAttention is the same ladder applied to attention
+  ([8.5](/learn/m08/flashattention)).
+</Callout>
+
+## Lab: three matmuls and cuBLAS 🔴
+
+```bash
+cd labs/m06/6.1 && nvcc -O2 -arch=native -DUSE_CUBLAS matmul.cu -o matmul -lcublas && ./matmul
+```
+
+<Callout type="note" title="Exercises">
+  1. Change the tile to 16 × 16 (and the block to 16 × 16 threads). Faster or slower, and why?
+  2. The kernels assume N is a multiple of 32. Add bounds checks so N = 1000 works, loading zeros outside the matrix.
+  3. In `mm_tiled`, remove the second `__syncthreads()`. Does the answer change? Run it under `compute-sanitizer --tool racecheck`.
+  4. Time a 4096 × 4096 × 1 product (a matrix-vector product with cuBLAS `cublasSgemv`). What is its intensity, and which roofline regime is it in? That is decode.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 3, Ch 36–51: matmul from naive to tiled, and why GEMM dominates." />
+  <SourceCard id="CUDA100" note="Days 15 and 33: tiled matrix multiplication in shared memory." />
+  <SourceCard id="FREGLY" note="Memory access patterns and tiling for GEMM." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'How many FLOPs does a 4096 × 4096 × 4096 matmul take?',
+      options: ['16.8 million', '68.7 billion', '137 billion', '275 billion'],
+      answer: 2,
+      explain: '2 × 4096³ ≈ 137 billion: one multiply and one add per term of each dot product.',
+    },
+    {
+      q: 'Why is the naive kernel (threadIdx.x → row) so slow?',
+      options: [
+        'It does more FLOPs',
+        'A warp\'s 32 threads read elements of A that are N floats apart, so each load touches 32 separate sectors',
+        'It does not use the cache',
+        'It has a race condition',
+      ],
+      answer: 1,
+      explain: 'Swapping the mapping so threadIdx.x picks the column makes the warp read 32 adjacent elements of B instead.',
+    },
+    {
+      q: 'With 32 × 32 shared-memory tiles, by how much does global memory traffic fall?',
+      options: ['2×', '8×', '32×', '1024×'],
+      answer: 2,
+      explain: 'Each element loaded into shared memory is used by the 32 threads along a row or column of the tile.',
+    },
+    {
+      q: 'After tiling, the kernel is still 6.7× slower than cuBLAS. What limits it now?',
+      options: [
+        'DRAM bandwidth',
+        'Shared-memory loads: two per FMA, more than the SM can issue alongside its FMAs',
+        'Kernel launch overhead',
+        'Bank conflicts in every access',
+      ],
+      answer: 1,
+      explain: 'The fix is to reuse values from registers: each thread computes several outputs (6.2).',
+    },
+  ]}
+/>

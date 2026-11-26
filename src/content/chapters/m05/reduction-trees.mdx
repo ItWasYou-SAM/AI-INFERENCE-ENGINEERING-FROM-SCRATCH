@@ -107,8 +107,10 @@ On a modern GPU the warp scheduler hides divergence and bank conflicts in such a
 issue.
 
 What *does* matter is **bytes in flight**. In v1–v3 every block loads 1 KB and then spends 8 barrier-separated steps in the tree, issuing no
-loads at all. Giving each thread a second element (v4) doubles the rate at once, and v5 reaches 127 GB/s. That is about as fast as this
-GPU reads memory in practice: a device-to-device copy, which also has to write, manages 123.
+loads at all. Giving each thread a second element (v4) doubles the rate at once, and v5 reaches 127 GB/s, as fast as a device-to-device
+copy in the same run (123 GB/s, counting its read and its write). That was the ceiling for this run. The laptop's memory was below its top
+clock, as often happens on battery or when hot. Rerun later with the memory at full clock, the unchanged v5 kernel reached 162 GB/s, close to
+the 168 GB/s peak.
 
 <Callout type="insight" title="The lesson generalizes">
   For memory-bound kernels, first ask whether there are enough loads in flight to cover memory latency (Little's law,
