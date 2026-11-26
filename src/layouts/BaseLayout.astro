@@ -13,6 +13,8 @@ interface Props {
 }
 const { title, description = 'Learn AI inference engineering from first principles: GPUs, CUDA, KV caches, serving engines and distributed inference.' } = Astro.props;
 const fullTitle = title === 'Home' ? 'Inference Engineering, from Scratch' : `${title} · Inference Engineering`;
+const canonical = new URL(Astro.url.pathname, Astro.site).href;
+const ogImage = new URL('/og.jpg', Astro.site).href;
 ---
 
 <!doctype html>
@@ -21,6 +23,20 @@ const fullTitle = title === 'Home' ? 'Inference Engineering, from Scratch' : `${
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Inference Engineering, from Scratch" />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Inference Engineering, from Scratch: how LLMs are served, from GPU memory to KV caches, batching and routing." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={fullTitle} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="icon" type="image/png" sizes="64x64" href="/favicon-64.png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />

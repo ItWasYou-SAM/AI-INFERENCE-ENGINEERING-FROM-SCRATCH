@@ -5,3 +5,5 @@ dist/
 __pycache__/
 *.pyc
 .env
+video/trailer/out/
+video/promo/out/

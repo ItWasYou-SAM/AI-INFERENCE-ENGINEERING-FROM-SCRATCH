@@ -9,7 +9,7 @@ import rehypeKatex from 'rehype-katex';
 import { unified } from '@astrojs/markdown-remark';
 
 export default defineConfig({
-  site: 'https://example.com',
+  site: 'https://ai-inference-engineering-from-scrat.vercel.app',
   integrations: [
     expressiveCode({
       themes: ['github-light', 'github-dark'],

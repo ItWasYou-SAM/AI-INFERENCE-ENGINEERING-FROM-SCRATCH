@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Inference Engineering, from Scratch: promo</title>
+<style>
+  @font-face { font-family: 'Fraunces'; src: url(../trailer/fonts/fraunces-latin-wght-normal.woff2) format('woff2'); font-weight: 100 900; font-style: normal; }
+  @font-face { font-family: 'Fraunces'; src: url(../trailer/fonts/fraunces-latin-wght-italic.woff2) format('woff2'); font-weight: 100 900; font-style: italic; }
+  @font-face { font-family: 'JBM'; src: url(../trailer/fonts/jetbrains-mono-latin-wght-normal.woff2) format('woff2'); font-weight: 100 800; }
+  @font-face { font-family: 'Serif4'; src: url(../trailer/fonts/source-serif-4-latin-wght-normal.woff2) format('woff2'); font-weight: 200 900; }
+  html, body { margin: 0; height: 100%; background: #07090d; overflow: hidden; }
+  body { display: grid; place-items: center; }
+  canvas { width: min(100vw, 177.78vh); height: auto; display: block; }
+  body.render canvas { width: 1920px; }
+</style>
+</head>
+<body>
+<canvas id="cv" width="1920" height="1080"></canvas>
+<script src="lib.js"></script>
+<script>
+useCanvas(document.getElementById('cv'));
+// Scene start times (seconds). The narrator, music and sound effects all key off these.
+const TL = { hook: 0, course: 4.0, roadmap: 8.4, req: 12.2, kv: 16.0, labs: 19.6, cta: 23.6, end: 28.0 };
+const D = TL.end;
+// What the narrator says, and when. narrate.py turns these into speech (see README).
+const NARRATION = [
+  { t: 0.35, text: 'You talk to an AI every day. What happens when you press Enter?' },
+  { t: 4.1, text: 'Inference Engineering, from Scratch: a free course on how LLMs are served.' },
+  { t: 8.75, text: 'Four levels take you from your very first token to serving at scale.' },
+  { t: 12.4, text: 'Every idea is interactive. Follow one request through a server,' },
+  { t: 16.2, text: 'then add users until the GPU runs out of memory.' },
+  { t: 19.8, text: 'Write real GPU kernels, and measure them yourself.' },
+  { t: 23.8, text: "Free and open source. Start with chapter zero point one." },
+];
+const EVENTS = [];
+const ev = (t, type, p = 0) => EVENTS.push({ t: +t.toFixed(3), type, p });
+
+// headline with words rising in; *word* is set in amber italic
+function headline(str, lt, o = {}) {
+  const size = o.size || 60, y = o.y || 200, start = o.start ?? 0.2;
+  const parts = str.split(' ').map((w) => { const em = w.startsWith('*'); const tx = w.replace(/\*/g, ''); return { tx, em, f: font(size, em ? 500 : 480, 'd', em) }; });
+  const sp = measure(' ', font(size));
+  const total = parts.reduce((s, p) => s + measure(p.tx, p.f), 0) + sp * (parts.length - 1);
+  let x = o.align === 'center' ? (W - total) / 2 : o.x ?? 160;
+  parts.forEach((p, i) => {
+    const q = eo(seg(lt, start + i * 0.04, start + i * 0.04 + 0.4));
+    T(p.tx, x, y + (1 - q) * 24, { f: p.f, c: p.em ? C.amber : C.ink, a: q });
+    x += measure(p.tx, p.f) + sp;
+  });
+}
+const S = [];
+const scene = (s, e, draw) => S.push({ s, e, draw });
+
+/* ── hook ──────────────────────────────────────────────────────────── */
+const Q1 = 'You talk to an AI every day.';
+const Q2 = 'What happens when you press Enter?';
+for (let i = 0; i < Q1.length; i += 2) ev(0.4 + (i / Q1.length) * 1.1, 'key', i);
+for (let i = 0; i < Q2.length; i += 2) ev(1.8 + (i / Q2.length) * 1.3, 'key', i);
+ev(3.35, 'tick', 2);
+scene(TL.hook, TL.course, (t, lt) => {
+  const n1 = Math.floor(Q1.length * seg(lt, 0.4, 1.5)), n2 = Math.floor(Q2.length * seg(lt, 1.8, 3.1));
+  T(Q1.slice(0, n1), W / 2, 470, { f: font(52, 420, 's'), c: C.soft, align: 'center' });
+  const f2 = font(80, 520);
+  const full = measure(Q2, f2), shown = Q2.slice(0, n2);
+  T(shown, (W - full) / 2, 590, { f: f2 });
+  if (n2 < Q2.length || Math.floor(lt * 2.2) % 2 === 0) {
+    const cx = (W - full) / 2 + measure(shown, f2) + 8;
+    ctx.fillStyle = C.amber; ctx.fillRect(cx, 530, 5, 72);
+  }
+  // the Enter key
+  const k = eo(seg(lt, 3.0, 3.3)), press = seg(lt, 3.35, 3.5) - seg(lt, 3.5, 3.7);
+  if (k > 0) {
+    ctx.save(); ctx.globalAlpha = k;
+    rr(W / 2 - 90, 700 + press * 6, 180, 74, 14, rgba(C.amber, 0.14 + 0.2 * press), rgba(C.amber, 0.8), 2);
+    T('Enter', W / 2, 748 + press * 6, { f: font(28, 500, 'm'), c: C.amber, align: 'center' });
+    ctx.restore();
+  }
+});
+
+/* ── the course, live ──────────────────────────────────────────────── */
+ev(TL.course + 0.1, 'boom');
+scene(TL.course, TL.roadmap, (t, lt) => {
+  const up = eo(seg(lt, 0.0, 0.9));
+  const bw = 1360, bh = 850;
+  const bx = (W - bw) / 2, by = 190 + (1 - up) * 160;
+  browser(bx, by, bw, bh, 'inference-from-scratch · home', (x, y, w, h) => {
+    const dark = seg(lt, 2.6, 3.3);
+    crop(IMG['home-hero'], x, y, w, h);
+    if (dark > 0) { ctx.save(); ctx.beginPath(); ctx.rect(x, y, w * eio(dark), h); ctx.clip(); crop(IMG['home-hero-dark'], x, y, w, h); ctx.restore(); }
+  }, { a: up });
+  const ta = eo(seg(lt, 0.3, 1.0));
+  titleLockup(W / 2, 112, 72, ta);
+  T('A free, open course on how LLMs are served, from GPU memory to KV caches.', W / 2, 168,
+    { f: font(30, 400, 's'), c: C.soft, align: 'center', a: eo(seg(lt, 0.7, 1.3)) });
+  if (lt > 2.6) pill('light or dark, your pick', bx + bw - 330, by + bh - 80, C.amber, { a: eo(seg(lt, 2.8, 3.2)) });
+});
+ev(TL.course + 2.7, 'swish');
+
+/* ── the roadmap ───────────────────────────────────────────────────── */
+const LEVELS = [['L1', 'Beginner', 'What is inference?', C.teal], ['L2', 'Intermediate', 'Write GPU code', C.blue], ['L3', 'Advanced', 'Build an engine', C.violet], ['L4', 'Expert', 'Serve at scale', C.amber]];
+LEVELS.forEach((_, i) => ev(TL.roadmap + 0.9 + i * 0.32, 'blip', i));
+scene(TL.roadmap, TL.req, (t, lt) => {
+  headline('From *"what* *is* *a* *token?"* to running inference at scale.', lt, { y: 150, size: 58, align: 'center' });
+  const bx = 160, by = 230, bw = 900, bh = 760;
+  browser(bx, by, bw, bh, 'inference-from-scratch · roadmap', (x, y, w, h) => {
+    const img = IMG['roadmap-full'];
+    const k = w / img.naturalWidth;
+    const maxScroll = img.naturalHeight - h / k;
+    const sy = maxScroll * 0.72 * eio(seg(lt, 0.6, 3.6));
+    crop(img, x, y, w, h, 0, sy);
+  }, { a: eo(seg(lt, 0, 0.6)) });
+  LEVELS.forEach(([n, name, q, col], i) => {
+    const a = eo(seg(lt, 0.9 + i * 0.32, 1.4 + i * 0.32));
+    const y = 270 + i * 168 + (1 - a) * 20;
+    ctx.save(); ctx.globalAlpha = a;
+    rr(1140, y, 620, 140, 18, rgba(col, 0.08), rgba(col, 0.6), 2);
+    T(n, 1180, y + 60, { f: font(26, 600, 'm'), c: col });
+    T(name, 1250, y + 62, { f: font(44, 520) });
+    T(q, 1250, y + 108, { f: font(28, 400, 's'), c: C.soft });
+    ctx.restore();
+  });
+  T('4 levels · 18 modules · 109 chapters', 1450, 990, { f: font(26, 500, 'm'), c: C.amber, align: 'center', a: eo(seg(lt, 2.4, 2.9)) });
+});
+ev(TL.req - 0.3, 'whoosh');
+
+/* ── interactive figures ───────────────────────────────────────────── */
+// each: frames (shot names), click targets in image pixels for the click that leads to the next frame
+const FIGS = [
+  { s: TL.req, e: TL.kv, tag: '0.2 · THE LIFE OF A REQUEST', title: 'Follow one request through a server', body: 'Tokenize, schedule, prefill, then decode one token at a time while the KV cache fills.',
+    frames: ['fig-request-0', 'fig-request-1', 'fig-request-2', 'fig-request-3', 'fig-request-4', 'fig-request-5'], click: () => [345, 92] },
+  { s: TL.kv, e: TL.labs, tag: '9.1 · HOW BIG IS THE KV CACHE?', title: 'Add users until the GPU runs out of memory', body: 'Then switch the KV cache to FP8 and watch twice as many fit.',
+    frames: ['fig-kv-0', 'fig-kv-1', 'fig-kv-2', 'fig-kv-3', 'fig-kv-4', 'fig-kv-5'], click: (i) => i < 4 ? [582 + (473 * [40, 80, 107, 150][i]) / 256, 497] : [1000, 347] },
+];
+scene(TL.req, TL.labs, (t, lt) => {
+  headline('Every idea is something you can *play* *with.*', lt, { y: 132, size: 52, x: 160 });
+});
+FIGS.forEach((F, fi) => {
+  const n = F.frames.length, dur = F.e - F.s;
+  const t0 = 0.6, step = (dur - t0 - 0.5) / (n - 1);
+  for (let i = 1; i < n; i++) ev(F.s + t0 + i * step, 'tick', i + fi);
+  scene(F.s, F.e, (t, lt) => {
+    const a = eo(seg(lt, 0.05, 0.5));
+    T(F.tag, 160, 290, { f: font(22, 600, 'm'), c: C.amber, ls: 2, a });
+    const yb = wrap(F.title, 160, 370, 600, 66, { f: font(54, 520), a: eo(seg(lt, 0.12, 0.6)) });
+    wrap(F.body, 160, yb + 30, 580, 46, { f: font(32, 400, 's'), c: C.soft, a: eo(seg(lt, 0.25, 0.8)) });
+    // which frame
+    const fpos = clamp((lt - t0) / step, 0, n - 1);
+    const i = Math.floor(fpos + 1e-6), mix = eio(seg(lt, t0 + (i + 1) * step - 0.001, t0 + (i + 1) * step + 0.16));
+    const cardX = 840, cardY = 200, cardW = 940, cardH = 820;
+    const slide = (1 - eo(seg(lt, 0, 0.5))) * 60;
+    const r = figCard(cardX + slide, cardY, cardW, cardH, IMG[F.frames[i]], a);
+    if (i + 1 < n && mix > 0) figCard(cardX + slide, cardY, cardW, cardH, IMG[F.frames[i + 1]], mix);
+    // cursor: glide to the next click target, press at the frame change
+    const k = r.w / IMG[F.frames[0]].naturalWidth;
+    const nextI = Math.min(n - 2, Math.floor(fpos + 0.25));
+    const tgt = F.click(nextI), prev = F.click(Math.max(0, nextI - 1));
+    const tClick = t0 + (nextI + 1) * step;
+    const g = eio(seg(lt, tClick - step * 0.75, tClick - 0.1));
+    const px = r.x + lerp(nextI === 0 ? prev[0] + 200 : prev[0], tgt[0], g) * k, py = r.y + lerp(nextI === 0 ? prev[1] + 240 : prev[1], tgt[1], g) * k;
+    const press = seg(lt, tClick - 0.02, tClick + 0.3);
+    cursor(px, py, press > 0 && press < 1 ? press : 0, a * (1 - seg(lt, dur - 0.45, dur - 0.2)));
+  });
+});
+ev(TL.labs - 0.2, 'whoosh');
+
+/* ── real labs ─────────────────────────────────────────────────────── */
+const CMD = '$ nvcc -O2 -arch=native softmax.cu -o softmax && ./softmax';
+const OUT = [
+  ['GPU: NVIDIA GeForce RTX 3050 6GB Laptop GPU (sm_86, 20 SMs)', C.faint],
+  ['', C.ink],
+  ['attention: 16384 rows x 1024 (67 MB)', C.soft],
+  ['  3 kernels         2.725 ms    49.3 GB/s  PASS', C.ink],
+  ['  fused 3-pass      1.107 ms   121.2 GB/s  PASS', C.ink],
+  ['  online            1.130 ms   118.7 GB/s  PASS', C.ink],
+  ['  registers         1.086 ms   123.5 GB/s  PASS', C.ink],
+  ['  warp/row          1.089 ms   123.3 GB/s  PASS', C.ink],
+];
+for (let i = 0; i < CMD.length; i += 2) ev(TL.labs + 0.5 + (i / CMD.length) * 1.0, 'key', i);
+OUT.forEach((_, i) => { if (i > 2) ev(TL.labs + 1.6 + i * 0.1, 'blip', i); });
+ev(TL.labs + 2.5, 'chime');
+scene(TL.labs, TL.cta, (t, lt) => {
+  headline('Real code. *Real* *GPU* *numbers.*', lt, { y: 150, size: 60, align: 'center' });
+  const x = 200, y = 230, w = 1520, h = 560;
+  browser(x, y, w, h, 'labs/m05/5.7 · bash', (cx, cy, cw, ch) => {
+    ctx.fillStyle = '#0b0f15'; ctx.fillRect(cx, cy, cw, ch);
+    const n = Math.floor(CMD.length * seg(lt, 0.5, 1.5));
+    T(CMD.slice(0, n), cx + 40, cy + 64, { f: font(26, 500, 'm'), c: C.green });
+    OUT.forEach(([s, c], i) => {
+      const a = seg(lt, 1.6 + i * 0.1, 1.7 + i * 0.1);
+      if (a <= 0) return;
+      const hl = i === 4 ? eo(seg(lt, 2.5, 2.9)) : 0;
+      if (hl > 0) rr(cx + 28, cy + 120 + i * 44 - 32, 900, 44, 6, rgba(C.amber, 0.14 * hl));
+      T(s.replace(/PASS/, ''), cx + 40, cy + 120 + i * 44, { f: font(25, 400, 'm'), c, a });
+      if (s.includes('PASS')) T('PASS', cx + 40 + measure(s.replace(/PASS/, ''), font(25, 400, 'm')), cy + 120 + i * 44, { f: font(25, 600, 'm'), c: C.green, a });
+    });
+  }, { dark: true, a: eo(seg(lt, 0, 0.5)) });
+  const b = eo(seg(lt, 2.5, 3.0));
+  if (b > 0) {
+    ctx.save(); ctx.globalAlpha = b;
+    rr(1180, 470 - (1 - b) * 20, 470, 170, 20, rgba(C.amber, 0.12), rgba(C.amber, 0.85), 2);
+    T('2.5× faster', 1415, 548 - (1 - b) * 20, { f: font(64, 560), c: C.amber, align: 'center' });
+    T('after fusing three kernels into one', 1415, 600 - (1 - b) * 20, { f: font(24, 400, 's'), c: C.soft, align: 'center' });
+    ctx.restore();
+  }
+  pill('CPU labs · any laptop', 360, 850, C.green, { a: eo(seg(lt, 2.8, 3.2)) });
+  pill('GPU optional', 860, 850, C.amber, { a: eo(seg(lt, 2.9, 3.3)) });
+  pill('GPU labs · yours or free Colab', 1220, 850, C.red, { a: eo(seg(lt, 3.0, 3.4)) });
+});
+ev(TL.cta - 0.2, 'whoosh');
+
+/* ── call to action ────────────────────────────────────────────────── */
+ev(TL.cta + 0.3, 'boom'); ev(TL.cta + 1.6, 'chime');
+scene(TL.cta, D, (t, lt) => {
+  const la = eo(seg(lt, 0.1, 0.7));
+  if (logo.complete) { ctx.save(); ctx.globalAlpha = la; ctx.drawImage(logo, W / 2 - 46, 220, 92, 92); ctx.restore(); }
+  const ta = eo(seg(lt, 0.25, 1.0));
+  titleLockup(W / 2, 430 + (1 - ta) * 20, 92, ta);
+  T('Free and open source. Start today, no GPU needed.', W / 2, 520, { f: font(36, 400, 's'), c: C.soft, align: 'center', a: eo(seg(lt, 0.7, 1.2)) });
+  const ga = eo(seg(lt, 1.1, 1.6));
+  const uf = font(30, 500, 'm'), uw = measure(URL_GH, uf) + 120;
+  ctx.save(); ctx.globalAlpha = ga;
+  rr((W - uw) / 2, 610, uw, 84, 42, rgba(C.amber, 0.1), rgba(C.amber, 0.7), 2);
+  T('★', (W - uw) / 2 + 40, 664, { f: font(32, 500, 'm'), c: C.amber });
+  T(URL_GH, (W - uw) / 2 + 84, 663, { f: uf });
+  ctx.restore();
+  T('Star it, clone it, and start with Chapter 0.1 →', W / 2, 800, { f: font(36, 460, 'd', true), align: 'center', a: eo(seg(lt, 1.7, 2.3)) });
+});
+
+/* ── frame ────────────────────────────────────────────────────────── */
+function draw(t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  background(t, 0.4 + 0.6 * seg(t, TL.course - 0.4, TL.course + 1.2));
+  for (const sc of S) {
+    if (t < sc.s || t > sc.e) continue;
+    const lt = t - sc.s;
+    const fade = Math.min(eo(seg(lt, 0, 0.4)), 1 - eio(seg(t, sc.e - 0.4, sc.e)));
+    ctx.save();
+    ctx.globalAlpha = sc.e === D ? Math.min(1, eo(seg(lt, 0, 0.4))) : fade;
+    sc.draw(t, lt);
+    ctx.restore();
+  }
+  finishFrame(t);
+  const blk = Math.max(1 - seg(t, 0, 0.5), seg(t, D - 1.0, D - 0.1));
+  if (blk > 0) { ctx.fillStyle = `rgba(0,0,0,${blk})`; ctx.fillRect(0, 0, W, H); }
+}
+
+window.DURATION = D;
+window.EVENTS = EVENTS.sort((a, b) => a.t - b.t);
+window.TIMELINE = { duration: D, scenes: TL, narration: NARRATION };
+window.draw = draw;
+window.ready = Promise.all([fontsReady, imagesReady]);
+
+const params = new URLSearchParams(location.search);
+if (params.has('render')) document.body.classList.add('render');
+else {
+  let t0 = performance.now() - (parseFloat(params.get('t')) || 0) * 1000;
+  document.getElementById('cv').addEventListener('click', () => { t0 = performance.now(); });
+  window.ready.then(() => { const loop = (now) => { draw(((now - t0) / 1000) % D); requestAnimationFrame(loop); }; requestAnimationFrame(loop); });
+}
+</script>
+</body>
+</html>
