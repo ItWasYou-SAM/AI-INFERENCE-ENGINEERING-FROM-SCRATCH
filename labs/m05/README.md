@@ -21,6 +21,8 @@ On Colab, see the [Module 4 README](../m04/README.md). If your host compiler is 
 | 5.6 | `5.6/convolution.cu` | 2D convolution: naive, `__constant__` filter, shared-memory tile with halo; causal depthwise conv1d |
 | 5.7 | `5.7/softmax.cu` | softmax as 3 kernels, fused, online, in registers, and one warp per row, on three row shapes |
 
-The numbers quoted in the chapters were measured on an RTX 3050 6GB Laptop GPU (sm_86, 20 SMs, ~168 GB/s peak, ~125 GB/s
-reachable), built with CUDA 13.5. Laptop GPUs change clocks with temperature, so expect a few percent of noise between runs, and more
-on the slowest kernels. Yours will differ; compare the ratios.
+The numbers quoted in the chapters were measured on an RTX 3050 6GB Laptop GPU (sm_86, 20 SMs, ~168 GB/s peak), built with
+CUDA 13.5. During these runs the GPU's memory was below its top clock, so bandwidth-bound kernels topped out near 125 GB/s; rerun
+at full clock, the 5.1 v5 kernel reaches 162 GB/s. The comparisons between kernels were all measured in the same state. Laptop GPUs
+change clocks with power source and temperature, so expect noise between runs, and more on the slowest kernels. Yours will differ;
+compare the ratios.
