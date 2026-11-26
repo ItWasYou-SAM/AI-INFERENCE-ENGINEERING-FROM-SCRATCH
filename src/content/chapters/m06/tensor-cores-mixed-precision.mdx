@@ -1,0 +1,176 @@
+---
+summary: "Tensor cores multiply small matrix tiles in a single warp instruction, several times faster than the ordinary FP32 cores, as long as the inputs are in a narrower format. This chapter explains the formats (TF32, FP16, BF16), measures speed and error for each, and writes a WMMA kernel that reaches 75% of cuBLAS."
+duration: 30 min
+objectives:
+  - Explain what a tensor core computes, and why it needs narrower input formats
+  - Compare FP32, TF32, FP16 and BF16 in range and precision, and predict their errors
+  - Explain mixed precision, with low-precision inputs and an FP32 accumulator, and why LLM inference uses it
+  - Write a WMMA kernel, and explain why the naive version is slower than FP32
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Everything so far in this module ran on the **CUDA cores**, which do one scalar FMA per lane per instruction. Since Volta (2017), each SM
+also has **tensor cores**: units that multiply whole matrix tiles. On Ampere, one warp-wide instruction computes
+$D = A \times B + C$ for a 16 × 8 × 16 tile of FP16, which is 2,048 multiply-adds per instruction.
+
+That is where nearly all of an LLM's FLOPs actually run.
+
+## Narrower numbers
+
+Tensor cores get their speed partly from narrow inputs: smaller multipliers, and more values per byte moved. The formats:
+
+| Format | Bits | Exponent | Mantissa | Largest value | Relative precision |
+|:--|--:|--:|--:|--:|--:|
+| FP32 | 32 | 8 | 23 | 3.4 × 10³⁸ | 6 × 10⁻⁸ |
+| TF32 | 19 (stored as 32) | 8 | 10 | 3.4 × 10³⁸ | 5 × 10⁻⁴ |
+| FP16 | 16 | 5 | 10 | 65,504 | 5 × 10⁻⁴ |
+| BF16 | 16 | 8 | 7 | 3.4 × 10³⁸ | 4 × 10⁻³ |
+
+- **TF32** keeps FP32's range and storage but rounds the mantissa to 10 bits inside the tensor core. FP32 code gets tensor-core speed with
+  no changes to the data.
+- **FP16** has the same precision but a tiny range: anything above 65,504 overflows. Training in FP16 needs loss scaling for that reason.
+- **BF16** keeps FP32's range with less precision. It almost never overflows, which is why it became the default format for LLM weights.
+
+[12.1](/learn/m12/number-formats) goes further, down to FP8 and INT4.
+
+## Mixed precision
+
+Products of FP16 or BF16 inputs are accumulated in **FP32**. A dot product of length 4,096 sums 4,096 terms. In FP16 the running sum would
+lose low bits at every step and could overflow, while FP32 keeps it accurate. "Mixed precision" means narrow inputs and a wide accumulator,
+and it is the standard for LLM inference: BF16 or FP16 weights and activations, with FP32 accumulation inside every GEMM.
+
+## Measured
+
+The same 4096 × 4096 × 4096 matmul, inputs uniform in $[-1, 1]$:
+
+```text title="output (RTX 3050 6GB Laptop)"
+4096 x 4096 x 4096 matmul, inputs uniform in [-1, 1]; largest |C| = 121.2
+                            time    TFLOP/s    vs FP32    max |error|
+  cuBLAS FP32           30.18 ms       4.55       1.0x
+  cuBLAS TF32           15.76 ms       8.72       1.9x        3.1e-02
+  cuBLAS FP16->FP32      8.37 ms      16.42       3.6x        3.1e-02
+  cuBLAS BF16->FP32      8.00 ms      17.18       3.8x        2.4e-01
+  cuBLAS FP16->FP16      5.30 ms      25.92       5.7x        1.0e+00
+  WMMA naive            96.70 ms       1.42       0.3x        3.1e-02
+  WMMA tiled            11.12 ms      12.36       2.7x        3.1e-02
+```
+
+**Speed.** TF32 doubles FP32 with no change to the data. FP16 or BF16 with an FP32 accumulator gives **3.6–3.8×**. FP16 with an FP16
+accumulator is faster still, because on GeForce GPUs like this one, FP32 accumulation runs at half the tensor-core rate. (Data-center GPUs
+such as A100 and H100 run both at full rate.)
+
+**Error.** Every error here comes from rounding, measured against the FP32 result:
+
+- TF32 and FP16 inputs both have a 10-bit mantissa, so both give the same error, 0.03 on outputs up to 121. That's a relative error of about
+  $3 \times 10^{-4}$.
+- BF16 has 3 fewer mantissa bits, so its error is about $2^3 = 8\times$ larger: 0.24.
+- An **FP16 accumulator** pushes the error to 1.0. Near 100, FP16 values are 0.0625 apart, and each of 4,096 additions rounds. This is
+  why inference kernels accumulate in FP32.
+
+These sound large, but the network was trained with the same rounding. LLM inference in BF16 matches FP32 outputs closely in practice. The
+errors that matter come from going further, to FP8 and INT4, which is the subject of Module 12.
+
+## Writing tensor-core code: WMMA
+
+CUDA's WMMA API exposes tensor cores at warp level. A **fragment** is a 16 × 16 tile spread across the 32 lanes' registers, in a layout you
+don't need to know:
+
+```cpp
+// labs/m06/6.7/tensor_cores.cu, wmma_naive: one warp computes one 16 x 16 tile of C
+wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b;
+wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+wmma::fill_fragment(c, 0.0f);
+for (int k = 0; k < N; k += 16) {
+    wmma::load_matrix_sync(a, A + tile_row * 16 * N + k, N);   // the whole warp loads a 16 x 16 tile
+    wmma::load_matrix_sync(b, B + k * N + tile_col * 16, N);
+    wmma::mma_sync(c, a, b, c);                                // 4,096 multiply-adds, one call
+}
+wmma::store_matrix_sync(C + tile_row * 16 * N + tile_col * 16, c, N, wmma::mem_row_major);
+```
+
+This naive version runs at **1.4 TFLOP/s, slower than plain FP32**. The tensor core is idle most of the time, waiting on fragments loaded
+straight from global memory with no reuse. That is the 6.1 lesson again, only harsher: the faster the math, the more the memory hierarchy
+matters.
+
+The tiled version applies the 6.1 and 6.2 ideas. A block of 4 warps stages 64 × 32 and 32 × 64 tiles in shared memory with 16-byte loads,
+padded to avoid bank conflicts ([6.4](/learn/m06/bank-conflicts)), and each warp computes a 32 × 32 output from 2 × 2 fragments, reusing
+each loaded fragment twice. That alone gives **12.4 TFLOP/s, 75% of cuBLAS FP16** and 2.7× the best possible FP32.
+
+<Callout type="insight" title="Beyond WMMA">
+  WMMA is the portable, simplest layer. Production kernels go lower: the `mma.sync` PTX instruction with explicit fragment layouts and
+  `ldmatrix` for loading them (Ampere), and on Hopper the asynchronous **warpgroup** `wgmma` instructions fed by the TMA copy engine. Few
+  people write these by hand. CUTLASS, Triton ([8.6](/learn/m08/triton)) and FlashAttention generate them. What you need is the model:
+  tensor cores are only fast if tiles arrive in shared memory or registers as fast as they are consumed.
+</Callout>
+
+## Lab: tensor cores 🔴
+
+```bash
+cd labs/m06/6.7 && nvcc -O2 -arch=native -DUSE_CUBLAS tensor_cores.cu -o tensor_cores -lcublas && ./tensor_cores
+```
+
+Tensor cores need sm_70 or newer; on Colab, the T4 (sm_75) supports FP16 but not BF16 or TF32.
+
+<Callout type="note" title="Exercises">
+  1. Change the inputs to uniform in $[-100, 100]$. What happens to the FP16 → FP16 result? (Check the largest |C| against 65,504.)
+  2. Give each warp in `wmma_tiled` a 64 × 32 output (4 × 2 fragments) and a 128 × 64 block tile. How close to cuBLAS does it get?
+  3. Measure the matrix-vector case (N × 1) in FP32 and FP16. Do tensor cores help when the kernel is memory-bound? (Think about bytes per weight.)
+  4. Compute the relative error of each format against a double-precision reference on the CPU for a 256 × 256 product. Does FP32 cuBLAS have measurable error too?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 3, Ch 36–51: tensor cores and mixed-precision GEMM." />
+  <SourceCard id="FREGLY" note="Tensor cores, TF32/BF16/FP16 and mixed precision in practice." />
+  <SourceCard id="CUDA100" note="Day 33: matmul on tensor cores with WMMA." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why is BF16 preferred over FP16 for LLM weights and activations?',
+      options: [
+        'It is more precise',
+        'It has FP32\'s 8-bit exponent, so it rarely overflows, at the cost of 3 mantissa bits',
+        'It is faster on all GPUs',
+        'It uses less memory',
+      ],
+      answer: 1,
+      explain: 'FP16 tops out at 65,504; BF16 covers the same range as FP32.',
+    },
+    {
+      q: 'What does "mixed precision" mean in a GEMM?',
+      options: [
+        'Some layers in FP32, others in FP16',
+        'Low-precision inputs (FP16/BF16) multiplied on tensor cores, with products summed in an FP32 accumulator',
+        'Randomly mixing formats',
+        'Storing weights in INT8',
+      ],
+      answer: 1,
+      explain: 'The accumulator stays wide so that long sums don\'t lose precision.',
+    },
+    {
+      q: 'Why was BF16\'s error about 8× FP16\'s in the lab?',
+      options: ['BF16 overflows', 'BF16 has 7 mantissa bits to FP16\'s 10: 2³ = 8× coarser rounding', 'BF16 is not supported', 'Random noise'],
+      answer: 1,
+      explain: 'With inputs in [-1, 1], neither format overflows, so precision alone decides the error.',
+    },
+    {
+      q: 'The naive WMMA kernel was slower than FP32 cuBLAS. Why?',
+      options: [
+        'Tensor cores are slower than CUDA cores',
+        'Each warp loaded its fragments straight from global memory with no reuse, so the tensor cores sat waiting for data',
+        'WMMA does not use tensor cores',
+        'FP16 conversion is slow',
+      ],
+      answer: 1,
+      explain: 'Staging tiles in shared memory and reusing fragments made it 8.7× faster.',
+    },
+  ]}
+/>

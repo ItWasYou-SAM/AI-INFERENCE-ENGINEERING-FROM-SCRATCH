@@ -1,0 +1,169 @@
+---
+summary: "The shared-memory tiled matmul spends more time loading from shared memory than multiplying. Register tiling fixes that: each thread computes a small block of outputs, held in registers, and reuses every value it loads many times. Three changes take the kernel from 15% to 94% of cuBLAS."
+duration: 30 min
+objectives:
+  - Count shared-memory loads per FMA for a kernel, and explain why that ratio limits it
+  - Write 1D and 2D register-tiled matmuls, where each thread computes an outer product per k-step
+  - Use float4 loads and a transposed shared-memory layout to cut instructions further
+  - Read registers per thread and blocks per SM, and connect them to occupancy
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+[6.1](/learn/m06/tiled-matmul) ended with a kernel limited by shared memory. Look at its inner loop:
+
+```cpp
+for (int k = 0; k < 32; k++) acc += As[ty][k] * Bs[k][tx];
+```
+
+Each iteration is **two shared-memory loads and one FMA**. An Ampere SM can issue 128 FP32 FMAs per clock, but only 32 shared-memory load
+lanes per clock. The FMA units spend most of their time waiting.
+
+The fix is the same idea as shared-memory tiling, one level down: **reuse values from registers**.
+
+## The outer product
+
+Suppose a thread computes a $T_M \times T_N$ block of outputs instead of one. At each $k$, it needs a column of $T_M$ values of $A$ and a row of
+$T_N$ values of $B$. Every pair multiplies into one output:
+
+$$
+\text{acc}[i][j] \mathrel{+}= a_i \cdot b_j \quad \text{for all } i < T_M,\ j < T_N
+$$
+
+That is an **outer product**: $T_M + T_N$ loads feed $T_M \cdot T_N$ FMAs.
+
+| Per thread | loads per k | FMAs per k | FMAs per load |
+|:--|--:|--:|--:|
+| 1 output (6.1) | 2 | 1 | 0.5 |
+| 8 outputs in a column (1D) | 9 | 8 | 0.9 |
+| 8 × 8 outputs (2D) | 16 | 64 | 4 |
+
+## 1D, then 2D
+
+**1D tiling** gives each thread 8 outputs down one column. A block computes a 64 × 64 tile with 512 threads. Each thread loads one value of
+$B$ and reuses it 8 times from a register.
+
+**2D tiling** gives each thread an 8 × 8 square. A block computes a 128 × 128 tile with only 256 threads, and each thread keeps 64
+accumulators, 8 values of $A$ and 8 of $B$ in registers:
+
+```cpp
+// labs/m06/6.2/register_tiling.cu, mm_2d (inner loop, per k-step of 8)
+for (int k = 0; k < BK; k++) {
+    for (int i = 0; i < TM; i++) regM[i] = As[(threadRow * TM + i) * BK + k];   // 8 loads of A
+    for (int j = 0; j < TN; j++) regN[j] = Bs[k * BN + threadCol * TN + j];     // 8 loads of B
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j++) acc[i * TN + j] += regM[i] * regN[j];      // 64 FMAs
+}
+```
+
+Everything here is fully unrolled (`#pragma unroll`), so `acc`, `regM` and `regN` become plain registers. That only works because every
+index is known at compile time; an array indexed by a runtime value would be placed in slow local memory instead
+([6.3](/learn/m06/register-pressure-spilling)).
+
+## Then: wider loads
+
+Two more changes finish the job:
+
+- **`float4` global loads.** Each thread brings in 16 bytes of $A$ and 16 of $B$ per k-step with one instruction each.
+- **Store $A$ transposed in shared memory.** The inner loop reads 8 *consecutive* values of $A$ for one $k$. If $A$'s tile is stored $k$-major
+  (`As[k][m]`), those 8 values are adjacent, and the compiler can load them with two 16-byte `LDS.128` instructions instead of eight 4-byte
+  ones.
+
+## Measured
+
+```text title="output (RTX 3050 6GB Laptop)"
+C = A * B, 4096 x 4096 FP32:
+  kernel              time   GFLOP/s  of cuBLAS   regs   blocks/SM  max error
+  tiled (6.1)    202.79 ms       678      14.9%     38           1    3.5e-04 PASS
+  1D tiling       68.16 ms      2016      44.3%     44           2    3.5e-04 PASS
+  2D tiling       46.22 ms      2973      65.3%    145           1    3.5e-04 PASS
+  2D + float4     32.04 ms      4290      94.2%    109           2    3.5e-04 PASS
+  cuBLAS          30.18 ms      4554     100.0%
+```
+
+**1D tiling: 3×. 2D: another 1.5×. Vectorizing: another 1.4×.** The last kernel is about 50 lines of CUDA, running at 94% of NVIDIA's library.
+
+Look at the **regs** column. The 2D kernel needs 145 registers per thread, so only one 256-thread block fits in an SM's 64 K registers. The
+vectorized kernel, with fewer address computations, needs 109, and two blocks fit. Registers are a budget shared by every thread on the SM,
+and [6.3](/learn/m06/register-pressure-spilling) is about spending it.
+
+<Callout type="insight" title="This is the structure of every fast GEMM">
+  cuBLAS, CUTLASS and Triton's matmul all use this hierarchy: a block tile in shared memory, a warp tile, and a thread tile in registers,
+  computing outer products. The remaining tricks are double-buffering (loading the next tile while computing this one), swizzled layouts that
+  avoid bank conflicts ([6.4](/learn/m06/bank-conflicts)), and tensor cores, which compute a whole 16 × 16 outer-product block per warp
+  instruction ([6.7](/learn/m06/tensor-cores-mixed-precision)).
+</Callout>
+
+## The last 6%
+
+What is cuBLAS doing that this kernel doesn't?
+
+- **Double-buffering.** While computing on one shared-memory tile, it loads the next. Our kernel waits at a barrier for every load.
+- **Warp tiling.** It arranges threads so that each warp covers a compact rectangle, which keeps shared-memory reads conflict-free and lets
+  more values be broadcast.
+- **Autotuning.** It picks tile sizes per GPU and per matrix shape. Our 128 × 128 tile is tuned to nothing in particular.
+
+For FP32 on CUDA cores that last 6% is rarely worth the effort. The bigger lever is moving to tensor cores ([6.7](/learn/m06/tensor-cores-mixed-precision)).
+
+## Lab: register tiling 🔴
+
+```bash
+cd labs/m06/6.2 && nvcc -O2 -arch=native -DUSE_CUBLAS register_tiling.cu -o register_tiling -lcublas && ./register_tiling
+```
+
+<Callout type="note" title="Exercises">
+  1. Count the shared-memory load instructions in one k-step of `mm_2d_vec` by hand, then check with `cuobjdump -sass` ([6.8](/learn/m06/reading-ptx-sass)).
+  2. Change `mm_2d_vec` to BK = 16. Does a deeper k-tile help? What happens to shared memory per block?
+  3. Add double-buffering: two copies of `As` and `Bs`, loading tile k+1 into one while computing on the other. How much of the last 6% does it recover?
+  4. Run the kernels at N = 1024. Which ones lose the most relative to cuBLAS, and why? (Count the blocks, and see [6.5](/learn/m06/wave-quantization).)
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 3, Ch 36–51: register blocking and the GEMM hierarchy." />
+  <SourceCard id="CUDA100" note="Days 15 and 33: matmul optimization beyond shared memory." />
+  <SourceCard id="FREGLY" note="Register tiling, vectorized loads and instruction-level efficiency." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A thread computes an 8 × 8 block of outputs. Per k-step, how many values does it load and how many FMAs does it do?',
+      options: ['2 loads, 64 FMAs', '16 loads, 64 FMAs', '64 loads, 64 FMAs', '16 loads, 16 FMAs'],
+      answer: 1,
+      explain: '8 values of A and 8 of B; every pair is one FMA: an outer product.',
+    },
+    {
+      q: 'Why must the per-thread accumulator array be indexed only with compile-time constants?',
+      options: [
+        'Arrays are not allowed in kernels',
+        'Registers cannot be indexed at run time, so a runtime index forces the array into slow local memory',
+        'It makes the code shorter',
+        'Shared memory requires it',
+      ],
+      answer: 1,
+      explain: 'With full unrolling every index is a constant, and each array element becomes its own register.',
+    },
+    {
+      q: 'Why store A\'s tile transposed (k-major) in shared memory?',
+      options: [
+        'To save memory',
+        'So the 8 values of A a thread needs for one k are adjacent, and can be read with wide 16-byte loads',
+        'Because global memory is column-major',
+        'To avoid __syncthreads',
+      ],
+      answer: 1,
+      explain: 'Two LDS.128 instructions replace eight 4-byte loads.',
+    },
+    {
+      q: 'The 2D kernel uses 145 registers per thread. How many 256-thread blocks can an SM with 65,536 registers hold?',
+      options: ['1', '2', '4', '8'],
+      answer: 0,
+      explain: '145 × 256 = 37,120 registers per block; two would need 74,240, more than 65,536.',
+    },
+  ]}
+/>

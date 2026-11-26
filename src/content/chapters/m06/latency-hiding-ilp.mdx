@@ -1,0 +1,160 @@
+---
+summary: "Every instruction on a GPU takes several cycles to produce its result, and a memory load takes hundreds. The SM hides that by always having another independent instruction ready, from another warp or from the same one. This chapter measures both sources, for arithmetic and for memory, and shows that instruction-level parallelism can stand in for occupancy."
+duration: 20 min
+objectives:
+  - Explain latency vs throughput, and why a dependent chain runs at latency speed
+  - Estimate the independent work needed to saturate FMA units and memory, using Little's law
+  - Raise instruction-level parallelism with multiple accumulators and batched loads
+  - Choose between more warps and more work per thread
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+[2.5](/learn/m02/occupancy-latency-hiding) explained latency hiding with warps: while one warp waits, the scheduler issues from another.
+[6.3](/learn/m06/register-pressure-spilling) then showed a matmul running *faster* at lower occupancy. This chapter explains how. A warp
+can also hide its own latency, if its next instruction doesn't depend on the one still in flight.
+
+## Latency and throughput
+
+An Ampere SM has 4 schedulers, each issuing one warp-instruction per cycle to 32 FP32 lanes. An FMA's result is ready about **4 cycles**
+after issue. Consider one warp running a dependent chain:
+
+```cpp
+a = fmaf(a, b, c);   // needs a from the previous line
+a = fmaf(a, b, c);
+a = fmaf(a, b, c);
+```
+
+Each FMA waits for the last, so the scheduler issues one every 4 cycles: **25% of its peak**. To issue every cycle, it needs 4 independent
+FMAs in flight, which can come from 4 warps, from 4 independent chains in one warp, or from any mix:
+
+$$
+\text{warps per scheduler} \times \text{independent instructions per warp} \gtrsim \text{latency} \times \text{issue rate}
+$$
+
+This is **Little's law** again ([2.5](/learn/m02/occupancy-latency-hiding)): work in flight = latency × throughput. Independent instructions
+within one thread are **instruction-level parallelism (ILP)**.
+
+## Measured: arithmetic
+
+Each thread runs ILP independent FMA chains, with 1 to 8 warps per scheduler:
+
+```text title="output (RTX 3050 6GB Laptop)"
+Part 1: FMA throughput, GFLOP/s (one block per SM; columns = independent chains per thread)
+    warps per SM     ILP 1     ILP 2     ILP 4     ILP 8
+      4 ( 1/sched)      1546      2643      4154      3724
+      8 ( 2/sched)      3091      4819      5461      4965
+     16 ( 4/sched)      5285      5958      6068      5749
+     32 ( 8/sched)      6012      6363      6554      6227
+```
+
+- With **one warp per scheduler and one chain**, the SM runs at 1.5 TFLOP/s. Four independent chains make the *same warps* run **2.7×
+  faster**.
+- With 8 warps per scheduler, ILP barely matters: other warps already fill the gaps.
+- Moving down a column and moving right along a row trade off against each other: **4 warps × ILP 4** (4,154) gets most of the way to
+  **16 warps × ILP 1** (5,285) with a quarter of the threads.
+- ILP 8 is slightly *worse* than ILP 4 at every occupancy. Eight chains need more registers, and four already cover the latency.
+
+## Measured: memory
+
+Memory latency is hundreds of cycles, so the numbers are bigger, but the law is the same. To stream at full bandwidth, the SMs together need
+$\text{bandwidth} \times \text{latency}$ bytes in flight. Each thread here issues ILP independent loads before using any of them:
+
+```text title="output"
+Part 2: read bandwidth, GB/s (two blocks per SM; columns = independent loads in flight per thread)
+    warps per SM     ILP 1     ILP 2     ILP 4     ILP 8
+               4      31.4      59.3     105.7     150.9
+               8      61.9     123.4     158.0     163.2
+              16     130.5     158.7     163.1     163.4
+              32     160.3     163.1     163.4     163.7
+              64     160.8     163.1     163.5     163.8
+```
+
+At 4 warps per SM, one load per thread reaches 31 GB/s. **Eight loads in flight per thread reach 151 GB/s, 4.8× more from the same warps.**
+Doubling the warps or doubling the loads in flight gives nearly the same gain, until about 163 GB/s, 97% of this GPU's 168 GB/s peak.
+
+<Callout type="insight" title="How fast kernels use this">
+  - **Multiple accumulators.** The 8 × 8 register tile in [6.2](/learn/m06/register-tiling) has 64 independent accumulators: ILP of 64 for
+    the FMAs, so the matmul can run at 1 or 2 blocks per SM.
+  - **Batched loads.** Load several values, *then* use them. The `float4` loads in 6.2 and the unrolled grid-stride loops in Module 5 do
+    this; so does `#pragma unroll` on a loop whose loads don't depend on each other.
+  - **Software pipelining.** Issue the loads for the next tile before computing on this one. That is double-buffering, and on Ampere and
+    later the `cp.async` instruction copies global memory to shared memory without even occupying registers.
+</Callout>
+
+## Where ILP runs out
+
+- **Registers.** Every independent chain or outstanding load needs its own registers, which lowers occupancy or causes spills
+  ([6.3](/learn/m06/register-pressure-spilling)).
+- **True dependences.** A reduction's final sum, or a recurrence such as a state-space model's scan over time, is a chain no matter what. The
+  usual trick is to split it into several partial chains and combine them at the end, which is exactly what a tree reduction does
+  ([5.1](/learn/m05/reduction-trees)).
+- **The compiler.** It reorders instructions to expose ILP, but only when it can prove independence. Pointer aliasing blocks it, which is
+  what `__restrict__` fixes ([6.8](/learn/m06/reading-ptx-sass)).
+
+## Lab: ILP vs occupancy 🔴
+
+```bash
+cd labs/m06/6.6 && nvcc -O2 -arch=native ilp.cu -o ilp && ./ilp
+```
+
+<Callout type="note" title="Exercises">
+  1. Add a 2-warps-per-SM row to Part 1 (half the schedulers have no warp at all). What is the best you can reach with ILP?
+  2. From the ILP-1 column of Part 2, estimate memory latency: bandwidth = (warps × 32 threads × 4 bytes × SMs) / latency.
+  3. Change Part 2 to load `float4` instead of `float`. How does that change the ILP needed for full bandwidth?
+  4. Rewrite the 5.1 `reduce_v5` loop with 4 independent partial sums. Does it get faster at full memory clock?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="FREGLY" note="Latency hiding, instruction-level parallelism and Little's law." />
+  <SourceCard id="BGE" note="Phase 3, Ch 36–51: latency, throughput and keeping the SM busy." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'An FMA has a 4-cycle latency. One warp per scheduler runs a single dependent chain. What fraction of peak FMA throughput does it reach?',
+      options: ['100%', '50%', '25%', '4%'],
+      answer: 2,
+      explain: 'One FMA every 4 cycles. It needs 4 independent FMAs in flight to issue every cycle.',
+    },
+    {
+      q: 'What is instruction-level parallelism?',
+      options: [
+        'Running many warps per SM',
+        'Independent instructions within a single thread that can be in flight at the same time',
+        'Using SIMD instructions',
+        'Launching many kernels at once',
+      ],
+      answer: 1,
+      explain: 'ILP hides latency inside a warp, as occupancy does across warps.',
+    },
+    {
+      q: 'In the lab, 4 warps per SM with 8 loads in flight reached 151 GB/s, against 31 GB/s with 1 load. Why?',
+      options: [
+        'The loads were cached',
+        'Bandwidth = bytes in flight / latency; eight independent loads per thread put about 5× more bytes in flight',
+        'Larger loads are faster',
+        'Fewer warps means less contention',
+      ],
+      answer: 1,
+      explain: 'Little\'s law: to stream at full bandwidth you need bandwidth × latency bytes outstanding, from any source.',
+    },
+    {
+      q: 'Why did ILP 8 run slightly slower than ILP 4 for the FMA chains?',
+      options: [
+        'Eight chains are more dependent',
+        'Four already cover the latency, and eight need more registers without adding useful parallelism',
+        'The compiler rejected it',
+        'Bank conflicts',
+      ],
+      answer: 1,
+      explain: 'Past the point where latency is hidden, more ILP only costs registers.',
+    },
+  ]}
+/>

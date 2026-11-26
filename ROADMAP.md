@@ -111,10 +111,10 @@ _From a naive matmul to a tiled, tensor-core-aware kernel._
 
 - **6.1** Naive → coalesced → shared-memory tiled matmul 🔴 ✨
 - **6.2** Register tiling: the tile inside the tile 🔴
-- **6.3** Register pressure, spilling and the occupancy trade-off
-- **6.4** Shared-memory bank conflicts ✨
-- **6.5** Wave quantization ✨
-- **6.6** Latency hiding and instruction-level parallelism
+- **6.3** Register pressure, spilling and the occupancy trade-off 🔴
+- **6.4** Shared-memory bank conflicts 🔴 ✨
+- **6.5** Wave quantization 🔴 ✨
+- **6.6** Latency hiding and instruction-level parallelism 🔴
 - **6.7** Tensor cores and mixed precision 🔴
 - **6.8** Reading PTX and SASS 🔴
 

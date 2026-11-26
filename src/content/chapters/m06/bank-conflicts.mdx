@@ -1,0 +1,144 @@
+---
+summary: "Shared memory is split into 32 banks, and a warp's access finishes in one pass only if its 32 lanes hit 32 different banks. Reading down a column of a 32-wide tile puts every lane in the same bank and takes 32 passes. This chapter shows how the banks work, measures the cost of each conflict, and fixes the classic case with one column of padding."
+duration: 20 min
+objectives:
+  - Compute the bank of a shared-memory address, and the number of passes a warp's access needs
+  - Recognize the stride patterns that conflict and the ones that don't
+  - Remove conflicts with padding, and know when swizzling is used instead
+  - Explain why a 2-way conflict can cost nothing in practice
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import BankConflicts from '../../../components/viz/BankConflicts.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Shared memory can deliver 32 four-byte words per clock, one to each lane of a warp, because it is built from **32 banks** that work in
+parallel. Consecutive 4-byte words go to consecutive banks:
+
+$$
+\text{bank}(\text{word index } i) = i \bmod 32
+$$
+
+When a warp issues a shared-memory load, each bank can serve **one word per pass**. If several lanes want *different* words from the same
+bank, they are served one after another. That is a **bank conflict**. If several lanes want the *same* word, it is read once and
+broadcast, which costs nothing.
+
+So the cost of a warp's access is the largest number of *distinct* words requested from any one bank: an **n-way conflict** takes n passes.
+
+<Figure label="fig. 6.4" caption="One warp's shared-memory access. Each lane (top) connects to the bank its word lives in (bottom). Stacked cells are distinct words a bank must deliver; each color is one pass. Pick an access pattern.">
+  <BankConflicts client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Compare **s[2 * lane]** and **s[3 * lane]**. Why does an odd stride never conflict? (Hint: an odd number and 32 share no factor, so lane × stride mod 32 hits every bank once.)
+  2. Pick **tile[lane][c], tile[32][32]**, then the padded **[32][33]** version. One extra column moves each row one bank over.
+  3. Try the **random gather**. How many passes does chance give you?
+</Callout>
+
+For lane $\ell$ reading word $\ell \cdot s$, the number of passes is $\gcd(s, 32)$: stride 2 is a 2-way conflict, stride 8 is 8-way, and any
+multiple of 32 puts every lane in one bank.
+
+## Measured
+
+The lab has every lane read `s[lane * stride]` 4,096 times:
+
+```text title="output (RTX 3050 6GB Laptop)"
+Each lane reads s[lane * stride], 4096 times; 80 blocks of 256 threads:
+  stride  predicted       time vs stride 1
+       0        1-way   0.182 ms       1.0x   all lanes read one word (broadcast)
+       1        1-way   0.182 ms       1.0x   consecutive words
+       2        2-way   0.183 ms       1.0x   every other word
+       3        1-way   0.183 ms       1.0x   odd stride
+       4        4-way   0.356 ms       2.0x
+       8        8-way   0.708 ms       3.9x
+      16       16-way   1.412 ms       7.7x
+      32       32-way   2.818 ms      15.5x   a column of float[32][32]
+      33        1-way   0.183 ms       1.0x   a column of float[32][33] (padded)
+```
+
+From 4-way on, time grows exactly with the number of passes: double the conflict, double the time. A column of an unpadded 32-wide tile is
+**15.5× slower** than a row. The padded tile is as fast as the best case.
+
+The 2-way conflict costs nothing *here*. The likely reason: even at stride 1, this loop doesn't keep the shared-memory pipeline full,
+because issuing each load and add takes time too, which leaves room for one extra pass. In a kernel that saturates shared memory, like the inner loop of
+a register-tiled matmul, a 2-way conflict does cost 2×. Treat small conflicts as cheap only after measuring.
+
+## Where conflicts come from
+
+**Columns of 2D tiles.** Any `__shared__ float tile[R][32]` read down a column is a 32-way conflict. This appears in transposes
+([4.7](/learn/m04/coalesced-vs-strided)), in matmul when one operand is read along $k$, and in attention when $K$ is read transposed.
+
+**The fix: padding.** Declare `tile[R][33]`. Row $r$ now starts at word $33r$, which is bank $r \bmod 32$, so a column visits all 32 banks.
+It costs one wasted column of shared memory.
+
+**The other fix: swizzling.** Instead of wasting memory, permute where each element is stored, typically XOR-ing the column index with
+bits of the row index: `tile[r][c ^ (r % 32)]`. Every row is still a permutation of the same banks, and every column lands in different
+banks. CUTLASS, FlashAttention and Triton all use swizzled layouts, because tensor-core loads (`ldmatrix`) need tiles with no padding gaps.
+
+<Callout type="insight" title="Wider accesses">
+  Lanes reading 8-byte (`float2`) or 16-byte (`float4`) values are processed in groups: a warp's 512-byte `float4` access is split into
+  4 phases of 8 lanes, and conflicts only count within a phase. That is why `LDS.128` reads in the 6.2 matmul stay conflict-free even though
+  each lane spans 4 banks.
+</Callout>
+
+## Lab: banks 🔴
+
+```bash
+cd labs/m06/6.4 && nvcc -O2 -arch=native bank_conflicts.cu -o bank_conflicts && ./bank_conflicts
+```
+
+<Callout type="note" title="Exercises">
+  1. Change the loop body to do more work per load (for example `acc = acc * 1.0001f + vs[idx]`). Does the 2-way conflict start to cost something?
+  2. Rewrite the access as `float2` with stride 1 and stride 16 (in `float2` units). Predict the passes, then measure.
+  3. Remove the `+ 1` padding from the transpose in `labs/m04/4.7/coalescing.cu` and measure the tiled transpose again.
+  4. Implement the swizzled tile `tile[r][c ^ r]` (for 32 × 32) and check that both a row and a column read are conflict-free.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 3, Ch 36–51: shared-memory banks, conflicts and padding." />
+  <SourceCard id="FREGLY" note="Shared-memory access patterns and bank conflicts." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Lane ℓ reads s[4 * ℓ] (floats). How many passes does the warp need?',
+      options: ['1', '2', '4', '32'],
+      answer: 2,
+      explain: 'gcd(4, 32) = 4: only 8 banks are used, each holding 4 requested words.',
+    },
+    {
+      q: 'All 32 lanes read s[7]. What happens?',
+      options: ['A 32-way conflict', 'The word is read once and broadcast: one pass', 'Undefined behaviour', 'A 7-way conflict'],
+      answer: 1,
+      explain: 'Conflicts only arise when lanes want different words from the same bank.',
+    },
+    {
+      q: 'Why does __shared__ float tile[32][33] remove the conflict when reading a column?',
+      options: [
+        'It is larger, so it is faster',
+        'Each row starts one bank later than the previous one, so the 32 elements of a column fall in 32 different banks',
+        'The compiler treats odd sizes specially',
+        'It forces broadcast',
+      ],
+      answer: 1,
+      explain: 'Element [r][c] is word 33r + c, in bank (r + c) mod 32.',
+    },
+    {
+      q: 'Why do tensor-core kernels usually swizzle instead of pad?',
+      options: [
+        'Padding is slower to compute',
+        'Swizzling avoids conflicts without wasting shared memory or leaving gaps in the tile layout that tensor-core loads expect',
+        'Padding does not work on new GPUs',
+        'Swizzling also speeds up global memory',
+      ],
+      answer: 1,
+      explain: 'An XOR permutation keeps tiles dense while spreading rows and columns across banks.',
+    },
+  ]}
+/>

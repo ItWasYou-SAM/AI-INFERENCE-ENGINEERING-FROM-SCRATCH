@@ -1,0 +1,223 @@
+---
+summary: "CUDA C++ is compiled twice: to PTX, a portable virtual assembly, then to SASS, the machine code a specific GPU runs. Reading SASS is how you check what the compiler actually did: whether loads are vectorized, whether a loop was unrolled, whether a value spilled. This chapter teaches enough of both to answer those questions, using small kernels and the matmul from 6.2."
+duration: 25 min
+objectives:
+  - Describe the CUDA compilation pipeline from .cu to PTX to SASS, and what each level is for
+  - Dump the PTX and SASS of a kernel, and map lines back to the source
+  - Recognize the common SASS instructions for loads, stores, arithmetic and control flow
+  - Use SASS to verify vectorization, __restrict__, unrolling, fast math and register tiling
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Every chapter in this module asked "what did the compiler do?" This chapter shows how to look.
+
+## Two assembly languages
+
+`nvcc` compiles device code in two steps:
+
+1. **CUDA C++ → PTX.** PTX (Parallel Thread Execution) is a virtual instruction set: typed, with unlimited virtual registers
+   (`%f1`, `%rd7`), and stable across GPU generations. It is what the front end produces, and what Triton and other compilers emit too.
+2. **PTX → SASS.** `ptxas` turns PTX into **SASS**, the real machine code for one architecture (sm_86, sm_90 …). This is where registers
+   are allocated, instructions are scheduled, and most optimization happens.
+
+A binary usually carries SASS for the GPUs it was built for, plus PTX that the driver can compile at load time for newer ones. PTX shows
+what you asked for. **SASS shows what runs.**
+
+```bash
+nvcc -O2 -arch=sm_86 -ptx kernels.cu -o kernels.ptx        # PTX, as text
+nvcc -O2 -arch=sm_86 -cubin kernels.cu -o kernels.cubin    # a GPU binary
+cuobjdump -sass -fun saxpy kernels.cubin                    # its SASS, for one kernel
+```
+
+The lab wraps these in `./inspect.sh <kernel>`. The online tool [godbolt.org](https://godbolt.org) also shows both for CUDA.
+
+## One kernel, both levels
+
+```cpp
+__global__ void saxpy(float a, const float* x, float* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a * x[i] + y[i];
+}
+```
+
+```text title="PTX (abridged)"
+mad.lo.s32      %r1, %r3, %r4, %r5;        // i = ctaid.x * ntid.x + tid.x
+setp.ge.s32     %p1, %r1, %r2;             // i >= n ?
+@%p1 bra        $L__BB0_2;                 // then skip to the end
+mul.wide.s32    %rd5, %r1, 4;              // byte offset = i * 4
+ld.global.f32   %f2, [%rd6];               // x[i]
+ld.global.f32   %f3, [%rd7];               // y[i]
+fma.rn.f32      %f4, %f2, %f1, %f3;        // a * x[i] + y[i]
+st.global.f32   [%rd7], %f4;               // y[i] = ...
+```
+
+```text title="SASS (sm_86)"
+S2R R4, SR_CTAID.X;                         // read blockIdx.x from a special register
+S2R R3, SR_TID.X;                           // threadIdx.x
+IMAD R4, R4, c[0x0][0x0], R3;               // i = blockIdx.x * blockDim.x + threadIdx.x
+ISETP.GE.AND P0, PT, R4, c[0x0][0x178], PT; // P0 = (i >= n)
+@P0 EXIT;                                   // predicated exit: threads with i >= n stop
+IMAD.WIDE R2, R4, R5, c[0x0][0x168];        // &x[i] (64-bit)
+IMAD.WIDE R4, R4, R5, c[0x0][0x170];        // &y[i]
+LDG.E R2, [R2.64];                          // load x[i] from global memory
+LDG.E R7, [R4.64];                          // load y[i]
+FFMA R7, R2, c[0x0][0x160], R7;             // a comes straight from constant bank 0
+STG.E [R4.64], R7;                          // store y[i]
+EXIT;
+```
+
+How to read it:
+
+- **Registers** are `R0`…`R254` (32-bit), with `RZ` always zero. A `.64` suffix on an address means a register pair.
+- **Kernel parameters** live in constant memory, `c[0x0][...]`, and instructions read them directly as operands. `blockDim.x` is
+  `c[0x0][0x0]`.
+- **Predicates** `P0`…`P6` hold booleans; `@P0` runs an instruction only where P0 is true. Short branches become predication instead of jumps.
+- **Names** tell you the unit: `LDG`/`STG` global, `LDS`/`STS` shared, `LDL`/`STL` local (spills!), `LDC` constant; `FFMA`/`FMUL`/`FADD`
+  FP32; `HMMA` tensor core; `MUFU` the special-function unit (exp2, rsqrt, sin); `BAR` barrier; `S2R` special registers.
+
+## What SASS can tell you
+
+The lab has five pairs of kernels that differ in one detail. `./inspect.sh all counts` prints each one's instruction mix:
+
+```text title="./inspect.sh all counts (sm_86, abridged)"
+saxpy                  LDG.E×2 IMAD.WIDE×2 STG.E×1 FFMA×1 ...
+saxpy4                 FFMA×4 LDG.E.128×2 IMAD.WIDE×2 STG.E.128×1 ...
+scale_rows             FMUL×8 LDG.E×7 STG.E×4 ...
+scale_rows_restrict    FMUL×8 STG.E×4 LDG.E.CONSTANT×4 ...
+exp_accurate           FFMA×2 MUFU.EX2×1 FFMA.SAT×1 FFMA.RM×1 FADD×1 FMUL×1 SHF.L.U32×1 ...
+exp_fast               FMUL×3 MUFU.EX2×1 FSETP.GEU.AND×1 ...
+dot8_loop              LDG.E×2 FFMA×1 IADD3×2 ISETP.NE.AND×1 BRA×2 ...
+dot8_unrolled          LDG.E×16 FFMA×8 ...
+```
+
+**Vectorization.** `saxpy4` reads `float4`s, and the SASS has one `LDG.E.128` per operand where `saxpy` had a 4-byte `LDG.E`: a quarter of
+the load instructions for the same bytes ([4.7](/learn/m04/coalesced-vs-strided)).
+
+**Aliasing.** `scale_rows` computes `out[r*4+j] = w[0] * w[j] * r` for four `j`. Without `__restrict__`, the compiler must assume a store
+to `out` could change `w`, so it **reloads `w[0]` after every store**: 7 loads. With `__restrict__`, it loads each value once (4 loads) and
+marks them `.CONSTANT`, routing them through the read-only cache:
+
+```text title="SASS: scale_rows (no __restrict__), excerpt"
+STG.E [R4.64], R7;          // out[0] = ...
+LDG.E R6, [R2.64];          // reload w[0]: the store might have changed it
+LDG.E R9, [R2.64+0x4];      // w[1]
+```
+
+**Fast math.** Both exp kernels use the hardware `MUFU.EX2` (2ˣ). `expf` first splits $x \log_2 e$ into high and low parts with extra
+FMAs, for accuracy at large $|x|$; `__expf` (or `-use_fast_math`) skips that:
+
+```text title="output"
+|x| <=    1   max relative error: expf 1.1e-07   __expf 5.5e-08
+|x| <=   10   max relative error: expf 1.1e-07   __expf 3.9e-07
+|x| <=   80   max relative error: expf 1.3e-07   __expf 3.6e-06
+```
+
+That's 30× more error at $|x| = 80$, and usually fine for softmax, where inputs are $x - \max \le 0$ ([5.7](/learn/m05/softmax-kernels)).
+
+**Unrolling.** With `#pragma unroll 1`, the dot product keeps a loop counter, a compare and a branch per iteration. Fully unrolled, it is 16
+loads and 8 FMAs in a straight line, and all 16 loads can be in flight at once ([6.6](/learn/m06/latency-hiding-ilp)).
+
+## Reading the matmul
+
+The real payoff is checking a hot loop. Here is the inner loop of the 6.2 `mm_2d_vec` kernel:
+
+```text title="SASS: mm_2d_vec inner loop (sm_86), excerpt"
+STS.128 [R6.X4+0x1000], R92;      // B tile → shared memory, 16 bytes
+BAR.SYNC.DEFER_BLOCKING 0x0;      // __syncthreads()
+LDS.128 R76, [R2+0x1000];         // 4 values of A from shared memory
+LDS.128 R80, [R3];                // 4 values of B
+LDS.128 R72, [R2+0x1010];         // 4 more of A
+FFMA R11, R76, R80, R84;          // acc += a * b
+FFMA R85, R80.reuse, R77, R85;    // .reuse: keep R80 in the operand cache
+FFMA R86, R80.reuse, R78, R86;
+FFMA R87, R80.reuse, R79, R87;
+...
+```
+
+Over the whole kernel there are **512 `FFMA` and 32 `LDS.128`**: 16 FMAs per shared-memory instruction, which is the register tiling of 6.2
+visible in the machine code. The `.reuse` flags show the compiler keeping a register in the operand-reuse cache across consecutive FMAs,
+saving register-file bandwidth. There are **no `LDL`/`STL`** (no spills), and the loads are 128-bit.
+
+<Callout type="insight" title="A checklist for a hot loop">
+  1. **Loads**: the width you expect (`.128`)? From the right space (`LDS` in the inner loop, not `LDG`)?
+  2. **Spills**: any `LDL` / `STL`? (Also `-Xptxas -v`, [6.3](/learn/m06/register-pressure-spilling).)
+  3. **Math**: the ratio of `FFMA` (or `HMMA`) to everything else. In a compute-bound kernel, most instructions should be math.
+  4. **Control**: unexpected `BRA` or loop counters where you wanted unrolling?
+
+  Nsight Compute shows the same SASS with per-instruction stall reasons, so you can see which line the warps are waiting on
+  ([7.2](/learn/m07/nsight-systems-vs-compute)).
+</Callout>
+
+## Lab: PTX and SASS 🔴
+
+```bash
+cd labs/m06/6.8
+./inspect.sh saxpy                # PTX and SASS
+./inspect.sh all counts           # instruction mix of every kernel
+nvcc -O2 -arch=native kernels.cu -o kernels && ./kernels    # runs and checks them
+```
+
+`inspect.sh` defaults to `sm_86`; set `ARCH=sm_75` for a T4, `sm_89` for RTX 40xx, `sm_90` for H100. Compiling for a different
+architecture doesn't need that GPU, so you can read H100 SASS on a laptop.
+
+<Callout type="note" title="Exercises">
+  1. Run `ARCH=sm_90 ./inspect.sh saxpy4 sass`. What changed from sm_86?
+  2. Build `kernels.cu` with `NVCC_FLAGS="-O2 -use_fast_math"` and compare `exp_accurate`. Where did the extra FFMAs go?
+  3. Dump the SASS of the 6.7 `wmma_tiled` kernel (`cuobjdump -sass` on the built binary) and find the `HMMA` instructions. How many per k-step of 32?
+  4. In the 6.3 lab, find the `LDL` and `STL` instructions in the "min 4 blocks/SM" build. Which values were spilled?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 3, Ch 36–51: the compilation pipeline, PTX and SASS." />
+  <SourceCard id="FREGLY" note="Inspecting compiler output to verify optimizations." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'What is the difference between PTX and SASS?',
+      options: [
+        'PTX is for AMD GPUs',
+        'PTX is a portable virtual ISA; SASS is the real machine code for one GPU architecture, produced from PTX by ptxas',
+        'SASS is a debugging format',
+        'They are the same thing',
+      ],
+      answer: 1,
+      explain: 'Register allocation, scheduling and most optimization happen when PTX becomes SASS.',
+    },
+    {
+      q: 'You see LDL and STL instructions inside a kernel\'s inner loop. What does that indicate?',
+      options: ['Shared-memory use', 'Register spills to local memory', 'Tensor-core loads', 'Constant memory reads'],
+      answer: 1,
+      explain: 'Local loads and stores in a hot loop almost always mean spilled registers.',
+    },
+    {
+      q: 'Why did adding __restrict__ remove three loads from scale_rows?',
+      options: [
+        'It enables float4',
+        'It promises out and w do not overlap, so the compiler need not reload w after each store to out',
+        'It moves w to shared memory',
+        'It disables bounds checks',
+      ],
+      answer: 1,
+      explain: 'Without it, any store through out might have modified w.',
+    },
+    {
+      q: 'The mm_2d_vec SASS has 512 FFMA and 32 LDS.128. What does that ratio show?',
+      options: [
+        'The kernel is memory-bound',
+        'Register tiling works: each shared-memory load instruction feeds 16 FMAs',
+        'The loop was not unrolled',
+        'There are bank conflicts',
+      ],
+      answer: 1,
+      explain: '16 values loaded per k-step (as four LDS.128) feed 64 FMAs in an 8 × 8 outer product.',
+    },
+  ]}
+/>

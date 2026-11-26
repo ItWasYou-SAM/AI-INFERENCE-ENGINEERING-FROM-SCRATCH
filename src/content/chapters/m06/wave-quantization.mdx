@@ -1,0 +1,163 @@
+---
+summary: "A GPU runs a grid in waves of as many blocks as fit at once. If the last wave is only partly full, much of the GPU sits idle for a whole block's runtime. This chapter shows the staircase that results, measures it on a synthetic kernel and a real matmul, and explains why matrix shapes like 4096 run faster per FLOP than 4224."
+duration: 15 min
+objectives:
+  - Compute the number of waves from tiles, SMs and blocks per SM
+  - Predict the utilization of the last wave, and the time cost of a partial wave
+  - Recognize wave quantization in GEMM shapes, and choose dimensions or tiles to avoid it
+  - Explain how split-K and stream-K kernels work around it
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import WaveQuantization from '../../../components/viz/WaveQuantization.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+The GPU's block scheduler places blocks on SMs until every SM is full, then waits for blocks to finish before placing more. If every
+block takes about the same time, which is true for a GEMM where every block computes one output tile, the grid runs in **waves**:
+
+$$
+\text{waves} = \left\lceil \frac{\text{blocks}}{\text{SMs} \times \text{blocks per SM}} \right\rceil
+$$
+
+A wave takes as long as one block, however many blocks it contains. So the run time is a **staircase** in the number of blocks, and a grid
+whose last wave is nearly empty pays a full wave's time for a sliver of work. This is **wave quantization**.
+
+## Measured: the staircase
+
+A synthetic kernel where every block spins for the same number of cycles, and only one block fits per SM:
+
+```text title="output (RTX 3050 6GB Laptop, 20 SMs)"
+Part 1: every block spins for 1000000 cycles; 1 block(s) fit per SM, 20 SMs:
+   blocks   waves      time      SM busy
+        1       1   0.67 ms           5%
+       10       1   0.68 ms          50%
+       19       1   0.68 ms          95%
+       20       1   0.68 ms         100%
+       21       2   1.35 ms          52%
+       30       2   1.35 ms          75%
+       39       2   1.35 ms          98%
+       40       2   1.35 ms         100%
+       41       3   2.02 ms          68%
+       60       3   2.02 ms         100%
+       61       4   2.69 ms          76%
+```
+
+One block takes as long as twenty. Twenty-one blocks take **twice** as long as twenty: one extra block adds a full wave.
+
+## In a real GEMM
+
+The lab repeats this with the register-tiled matmul from [6.2](/learn/m06/register-tiling): $M = 1280$, $K = 4096$, and $N$ growing one
+128-wide tile at a time. Two blocks fit per SM, so a wave is 40 tiles:
+
+```text title="output"
+Part 2: 1280 x N x 4096 matmul, 128 x 128 tiles; 2 blocks fit per SM, so 40 tiles per wave:
+       N  tiles  waves      time    GFLOP/s  ms per tile
+     128     10      1   0.75 ms       1796        0.075
+     256     20      1   0.75 ms       3573        0.038
+     384     30      1   1.00 ms       4012        0.033
+     512     40      1   1.02 ms       5264        0.025
+     640     50      2   1.82 ms       3696        0.036
+     768     60      2   2.01 ms       4010        0.033
+     896     70      2   2.34 ms       4012        0.033
+    1024     80      2   2.35 ms       4569        0.029
+    1152     90      3   3.19 ms       3790        0.035
+```
+
+Going from 40 to 50 tiles is **25% more work and 78% more time**. Throughput peaks exactly at full waves (40 and 80 tiles) and dips just
+after them.
+
+The steps are uneven within a wave, because two blocks share each SM. With 10 or 20 tiles, every block has an SM to itself and runs
+faster; at 30 or 40, pairs of blocks share SMs and each runs slower. The quantum that matters is really "how evenly is work spread across
+SMs", and full waves are the even case.
+
+<Figure label="fig. 6.5" caption="Output tiles packed into waves. Each row is one wave of block slots across all SMs; amber is the last, partial wave, hatching is idle hardware. Change the GPU, the tile size and the matrix shape.">
+  <WaveQuantization client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. On an **H100** with M = 4096, move N from 4224 to 4352. One more column of tiles adds a whole wave.
+  2. Keep that shape and switch the tile from 128 to 256. Fewer, bigger tiles: better or worse quantization?
+  3. Switch to the **RTX 3050** (20 SMs). Which sizes are full waves now? The best shapes depend on the GPU.
+</Callout>
+
+## What to do about it
+
+- **Pick shapes that fit.** Model dimensions are chosen as multiples of 64 or 128 partly for this reason. A vocabulary of 50,257 tokens
+  (GPT-2) is often padded to 50,304, a multiple of 64, for faster LM-head GEMMs.
+- **Let the library choose tiles.** cuBLAS and CUTLASS heuristics pick a tile size per shape, partly to make the tile count land near a
+  multiple of the SM count. That is one reason they beat a fixed-tile kernel on odd shapes.
+- **Split-K.** For skinny GEMMs with few output tiles but a long $K$, such as decode at small batch sizes, split the $K$ loop across
+  several blocks and add the partial results at the end (with atomics, or deterministically as in [5.3](/learn/m05/atomics-and-cas)). More
+  blocks means fuller waves.
+- **Stream-K.** Give each SM an equal share of the total *k-iterations*, crossing tile boundaries, so every SM finishes at the same
+  time. CUTLASS implements it, and it removes the tail entirely at the cost of fix-up work.
+- **Persistent kernels.** Launch exactly one block per SM slot and let each block loop over tiles from a queue. The same idea underlies
+  persistent attention and MoE kernels.
+
+<Callout type="insight" title="Why this matters more on big GPUs">
+  With 132 SMs, an H100 needs 132 tiles (or a multiple) for one even wave. During decode with a small batch, a GEMM's output often has fewer
+  tiles than that, so most of the GPU idles. That is the case split-K and FlashDecoding ([9.5](/learn/m09/split-kv-flash-decoding)) were
+  designed for.
+</Callout>
+
+## Lab: waves 🔴
+
+```bash
+cd labs/m06/6.5 && nvcc -O2 -arch=native waves.cu -o waves && ./waves
+```
+
+<Callout type="note" title="Exercises">
+  1. Change the spin kernel so 2 blocks fit per SM (halve the shared memory). Where are the steps now?
+  2. Extend Part 2 to N = 1536 … 3072. Do the throughput peaks stay at multiples of 40 tiles?
+  3. Make the spin time vary per block (for example `cycles * (1 + blockIdx.x % 3)`). Does the staircase survive?
+  4. Use cuBLAS (`sgemm_ref` from `../common.cuh`) for the same shapes. Is its curve smoother? Why might it be?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 3, Ch 36–51: waves, tiles and SM utilization." />
+  <SourceCard id="FREGLY" note="Occupancy, waves and GEMM shape selection." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A GPU has 108 SMs and fits 1 block per SM. A GEMM has 120 output tiles. How many waves, and how full is the last one?',
+      options: ['1 wave, full', '2 waves, last one 12 of 108 busy', '2 waves, both full', '120 waves'],
+      answer: 1,
+      explain: 'ceil(120 / 108) = 2. The second wave keeps only 12 SMs busy for a full block time.',
+    },
+    {
+      q: 'In the lab, 21 blocks took twice as long as 20. Why?',
+      options: [
+        'Launch overhead doubles',
+        'Only 20 blocks fit at once, so the 21st runs in a second wave by itself',
+        'The 21st block is slower',
+        'Memory bandwidth halves',
+      ],
+      answer: 1,
+      explain: 'A wave takes one block time regardless of how many blocks it holds.',
+    },
+    {
+      q: 'Why is a vocabulary of 50,257 often padded to 50,304?',
+      options: [
+        'To fit special tokens',
+        'A multiple of 64 gives whole tiles and better GEMM efficiency in the LM head',
+        'Tokenizers require it',
+        'For memory alignment only',
+      ],
+      answer: 1,
+      explain: 'Odd sizes leave partial tiles and partial waves; padding a few rows fixes both.',
+    },
+    {
+      q: 'A decode-time GEMM has only 16 output tiles on a 132-SM GPU. What helps?',
+      options: ['Bigger tiles', 'Split-K: divide the long K loop across blocks and add partial results', 'Fewer threads per block', 'Nothing'],
+      answer: 1,
+      explain: 'Splitting K multiplies the number of blocks, so more SMs get work.',
+    },
+  ]}
+/>

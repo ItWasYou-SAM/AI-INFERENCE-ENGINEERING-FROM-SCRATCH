@@ -1,0 +1,176 @@
+---
+summary: "Registers are the fastest storage on a GPU, and every thread on an SM draws from one fixed budget. Using more per thread means fewer threads fit; using fewer than the code needs makes the compiler spill to slow local memory. This chapter measures both sides of that trade-off on one kernel, and the result is lopsided."
+duration: 20 min
+objectives:
+  - Compute how many blocks fit per SM from registers per thread
+  - Read register and spill counts from -Xptxas -v and cudaFuncGetAttributes
+  - Use __launch_bounds__ and -maxrregcount, and predict when they cause spills
+  - Decide between higher occupancy and more work per thread
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+An Ampere SM has **65,536 32-bit registers**, shared by every thread resident on it, and at most 255 per thread. The register-tiled matmul
+in [6.2](/learn/m06/register-tiling) wanted 64 accumulators per thread plus inputs and addresses. Where does that budget go, and what
+happens when it runs out?
+
+## Registers decide occupancy
+
+Occupancy is the fraction of the SM's thread slots (1,536 on this GPU) that are filled ([2.5](/learn/m02/occupancy-latency-hiding)). The
+register file is one of its limits:
+
+$$
+\text{blocks per SM} \le \left\lfloor \frac{65{,}536}{\text{registers per thread} \times \text{threads per block}} \right\rfloor
+$$
+
+(rounded, because registers are allocated in chunks of 256 per warp). At 256 threads per block:
+
+| Registers per thread | Blocks per SM | Occupancy (of 1,536 threads) |
+|--:|--:|--:|
+| 64 | 4 | 67% |
+| 80 | 3 | 50% |
+| 128 | 2 | 33% |
+| 209 | 1 | 17% |
+
+Shared memory per block and the hardware block limit cap occupancy too. Whichever limit is tightest wins.
+
+## Seeing the numbers
+
+Two ways to find out what a kernel uses:
+
+```bash
+nvcc -O2 -arch=native -Xptxas -v register_pressure.cu ...
+# ptxas info : Used 127 registers, used 1 barriers, 8192 bytes smem, 380 bytes cmem[0]
+# ptxas info : Used 64 registers, 512 bytes cumulative stack size, ...
+#     512 bytes stack frame, 1372 bytes spill stores, 1272 bytes spill loads
+```
+
+or at run time with `cudaFuncGetAttributes(&attr, kernel)`, which reports `attr.numRegs` and `attr.localSizeBytes`, plus
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` for blocks per SM. The lab prints all three.
+
+## Spilling
+
+If a thread needs more registers than it is allowed, the compiler **spills**: it stores some values to *local memory* and reloads them when
+needed. Local memory is private to the thread but physically lives in DRAM, cached in L1 and L2. A spilled value costs a load and a store
+where a register cost nothing.
+
+You can cap registers in two ways:
+
+```cpp
+// per kernel: "I will launch 256 threads and want at least 3 blocks per SM"
+__global__ void __launch_bounds__(256, 3) mm(...);
+```
+
+```bash
+nvcc -maxrregcount=64 ...    # every kernel in the file
+```
+
+`__launch_bounds__(256, 3)` tells the compiler to fit $3 \times 256$ threads, so it caps registers at about $65{,}536 / 768 \approx 85$, and
+spills whatever doesn't fit.
+
+## Measured: one kernel, seven builds
+
+The lab builds the 6.2 kernel with different per-thread tiles and different bounds:
+
+```text title="output (RTX 3050 6GB Laptop)"
+4096 x 4096 FP32 matmul, one kernel built seven ways:
+  per-thread tile, bound      regs  spilled  blocks/SM  occupancy      time   GFLOP/s
+  4x4, no bound                 78      0 B          3        50%  52.99 ms      2594
+  8x4, no bound                 96      0 B          2        33%  44.44 ms      3093
+  8x8, no bound                127      0 B          2        33%  35.46 ms      3876
+  8x8, min 2 blocks/SM         127      0 B          2        33%  35.22 ms      3903
+  8x8, min 3 blocks/SM          80    168 B          3        50% 161.65 ms       850
+  8x8, min 4 blocks/SM          64    512 B          4        67% 1319.28 ms       104
+  16x8, no bound               209      0 B          2        17%  39.64 ms      3467
+  cuBLAS                                                           30.17 ms      4555
+```
+
+Read it in two directions.
+
+**More work per thread wins, up to a point.** From a 4×4 to an 8×8 thread tile, registers grow from 78 to 127 and occupancy *falls* from 50%
+to 33%, yet the kernel gets 1.5× faster. Each loaded value feeds more FMAs, and the extra independent accumulators give each warp its own
+latency hiding ([6.6](/learn/m06/latency-hiding-ilp)). At 16×8 the tile is too large: 209 registers, a 128-thread block, 17% occupancy, and
+it is slower again.
+
+**Forcing occupancy up is a disaster.** Asking for 3 blocks per SM caps the 8×8 kernel at 80 registers, which spills 168 bytes per thread
+and makes it **4.6× slower**. At 4 blocks per SM, 512 bytes spill (the whole accumulator array goes to local memory) and it is **37×
+slower**, even though occupancy doubled. In a loop that does 64 FMAs per few loads, adding a local-memory load and store to each FMA
+destroys everything register tiling bought.
+
+<Callout type="insight" title="Occupancy is a means, not a goal">
+  High occupancy hides latency by having many warps to switch between. A kernel can hide latency instead with independent work *inside* each
+  thread. Well-tuned GEMM and attention kernels often run with only one or two blocks per SM and large register tiles. Raise occupancy when profiles show
+  warps stalled on memory with nothing else to do, and never by forcing spills. Nsight Compute reports both the occupancy and the spill
+  traffic ([7.2](/learn/m07/nsight-systems-vs-compute)).
+</Callout>
+
+## Where registers go
+
+Common reasons a kernel uses more registers than you expect:
+
+- **Unrolled loops** keep many values alive at once. That is usually the point, but full unrolling of a long loop can overshoot.
+- **64-bit addresses.** Every pointer takes two registers, and every precomputed address another two. Recomputing addresses from one base pointer can save many.
+- **Arrays indexed at run time** don't live in registers at all; they go to local memory even with no spill reported in the "spill" line, and show up in the stack frame size.
+- **Inlined device functions and math library calls** (`expf`, `sinf`) bring their temporaries with them.
+
+## Lab: the occupancy trade-off 🔴
+
+```bash
+cd labs/m06/6.3 && nvcc -O2 -arch=native -DUSE_CUBLAS -Xptxas -v register_pressure.cu -o register_pressure -lcublas && ./register_pressure
+```
+
+<Callout type="note" title="Exercises">
+  1. Build with `-maxrregcount=96` and no `__launch_bounds__` minimum. Which variants change, and by how much?
+  2. Add an 8 × 8 variant with `BK = 16`. It needs twice the shared memory per block. Which limit sets its occupancy now?
+  3. Make one accumulator index depend on a runtime value (for example `acc[(i + threadIdx.x) % TM * TN + j]`). What do `-Xptxas -v` and the timing show?
+  4. Use `cudaOccupancyMaxPotentialBlockSize` to ask the runtime for the "best" block size for the 4×4 kernel. Is it the fastest?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="FREGLY" note="Register pressure, spilling, launch bounds and the occupancy trade-off." />
+  <SourceCard id="BGE" note="Phase 3, Ch 36–51: registers as the top of the memory hierarchy." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A kernel uses 96 registers per thread with 256-thread blocks. How many blocks fit in 65,536 registers?',
+      options: ['1', '2', '3', '4'],
+      answer: 1,
+      explain: '96 × 256 = 24,576 per block; 65,536 / 24,576 = 2.67, so 2 blocks.',
+    },
+    {
+      q: 'What does __launch_bounds__(256, 4) ask the compiler to do?',
+      options: [
+        'Launch exactly 4 blocks',
+        'Fit at least 4 blocks of 256 threads per SM, capping registers per thread at about 64 and spilling the rest',
+        'Use 4 warps',
+        'Unroll loops 4 times',
+      ],
+      answer: 1,
+      explain: '65,536 / (4 × 256) = 64 registers per thread.',
+    },
+    {
+      q: 'In the lab, raising occupancy from 33% to 67% made the matmul 37× slower. Why?',
+      options: [
+        'Higher occupancy always hurts',
+        'The register cap forced the accumulators into local memory, adding memory traffic to every FMA',
+        'Too many blocks caused bank conflicts',
+        'The GPU throttled',
+      ],
+      answer: 1,
+      explain: 'Spills turn register reuse into memory traffic; more warps cannot hide that.',
+    },
+    {
+      q: 'Where does spilled data live?',
+      options: ['In other threads\' registers', 'In shared memory', 'In local memory: thread-private, but stored in DRAM and cached in L1/L2', 'On the CPU'],
+      answer: 2,
+      explain: '"Local" refers to its scope, not its location.',
+    },
+  ]}
+/>
