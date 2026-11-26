@@ -1,0 +1,170 @@
+---
+summary: A histogram is a scatter of atomic increments into a few bins, so contention is its main cost. Privatization gives each block its own copy in shared memory and merges at the end. This chapter measures four histogram kernels on uniform, skewed and constant data, and shows that privatization only helps when each private copy absorbs a lot of input.
+duration: 20 min
+objectives:
+  - Explain why a naive histogram is limited by atomic contention, and why skewed data makes it worse
+  - Privatize a histogram in shared memory and merge the copies
+  - Explain why the merge cost decides whether privatization pays off
+  - "Recognize histograms in inference: token counts, expert loads and bucketing"
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+A **histogram** counts how many inputs fall into each bin. Unlike a reduction, each input updates a bin that depends on its *value*, so you
+can't know in advance which threads will collide. The obvious kernel is one atomic per input:
+
+```cpp
+atomicAdd(&hist[x[i]], 1);
+```
+
+Everything in [5.3](/learn/m05/atomics-and-cas) applies. With 256 bins, there are only 256 addresses, and if the data is skewed, most
+threads hit the same few.
+
+## In inference
+
+- **Token counts.** Repetition and frequency penalties need, for each sequence, how often each token has appeared so far
+  ([11.1](/learn/m11/sampling-strategies)). That is a histogram over the vocabulary.
+- **Expert load.** A mixture-of-experts router counts how many tokens go to each expert before it can pack them
+  ([14.5](/learn/m14/moe-expert-parallelism)). The counts are then scanned ([5.4](/learn/m05/prefix-sum-scan)) to get offsets.
+  Routing is often skewed: a few "hot" experts get most of the tokens.
+- **Bucketing.** Some quantization calibration methods pick activation ranges from a histogram ([12.5](/learn/m12/fp8-serving)), and
+  schedulers group requests by length the same way.
+
+## Privatization
+
+Give each block its **own** histogram in shared memory. Updates become shared-memory atomics: on-chip, cheap, and only contended within the
+block. At the end, each block adds its private counts into the global histogram, one atomic per non-empty bin.
+
+```cpp
+// labs/m05/5.5/histogram.cu, "private+"
+__shared__ unsigned local[256];
+local[threadIdx.x] = 0;                       // 256 threads, 256 bins
+__syncthreads();
+for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n / 4; i += gridDim.x * blockDim.x) {
+    uchar4 q = x4[i];                         // 4 bytes per load
+    atomicAdd(&local[q.x], 1u); atomicAdd(&local[q.y], 1u);
+    atomicAdd(&local[q.z], 1u); atomicAdd(&local[q.w], 1u);
+}
+__syncthreads();
+if (local[threadIdx.x]) atomicAdd(&hist[threadIdx.x], local[threadIdx.x]);   // merge
+```
+
+## Measured
+
+Four kernels on 64 M bytes. **global** uses one global atomic per byte. **private** keeps a shared-memory copy per block, with one byte per
+thread and a block for every 256 bytes. **private+** adds the grid-stride loop and 4-byte loads, so there are only 120 blocks. **per-warp**
+gives each warp its own shared-memory copy.
+
+```text title="output (RTX 3050 6GB Laptop): time in ms (GB/s)"
+256-bin histogram of 67108864 bytes. Time in ms (GB/s):
+  input                    global              private             private+             per-warp
+  uniform          21.834 (  3.1)        2.871 ( 23.4)        0.533 (125.8)        0.532 (126.0)
+  skewed           35.214 (  1.9)        1.815 ( 37.0)        0.537 (125.1)        0.535 (125.5)
+  constant         36.253 (  1.9)        1.204 ( 55.7)        0.534 (125.6)        0.533 (125.9)
+```
+
+Three things stand out.
+
+**1. Global atomics are slow, and skew makes them slower.** 22 ms for uniform data, 35 ms when 90% of the bytes are zero. That is 40 to 70
+times slower than reading the data.
+
+**2. Plain privatization is faster on constant data than on uniform data**, which looks backwards. The cause is the merge. With one byte per
+thread, each block has only 256 inputs. On uniform data, those land in about 160 different bins, so the merge does about 160 global atomics
+per block: 42 million in total, about one for every 1.6 input bytes. Privatization helped, but the merge is now the bottleneck. On constant
+data each block merges just one bin. (Inside the block, the constant input means every lane of a warp updates the same shared address. That
+would be the worst case, but the measurement shows this GPU handles it cheaply.)
+
+**3. Give each private copy a lot of input, and the problem disappears.** With 120 blocks each covering 0.5 MB, the merge costs
+120 × 256 atomics in total, which is nothing. All three distributions run at 126 GB/s, the speed of reading the input. Per-warp copies, which
+cut contention inside the block, have nothing left to fix on this GPU.
+
+<Callout type="insight" title="The rule">
+  Privatization trades contention for a merge. It pays off only when each private copy absorbs **many more inputs than it has bins**. Size
+  the grid to the GPU, not to the data, so that every copy covers a large share of the input.
+</Callout>
+
+## When the bins don't fit
+
+256 bins × 4 bytes = 1 KB of shared memory, which fits easily. A vocabulary-sized histogram, with 128 K bins, takes 512 KB and fits in no
+SM's shared memory. Options:
+
+- **Keep it in global memory, and use the cache.** 128 K counters fit in L2, and with a large vocabulary most updates go to different
+  addresses anyway, which is the fast case from 5.3.
+- **Use smaller counters.** If counts are known to stay below 65,536, pack two 16-bit counters per word, or one per sequence in a
+  per-request buffer.
+- **Sort first.** Sort the keys, then the count for each bin is the length of a run, found with a scan. With no atomics, this is also
+  deterministic.
+- **Aggregate within the warp first.** `__match_any_sync` finds the lanes holding the same key, so one lane per group does the atomic. This
+  helps most with skewed data.
+
+## Lab: four histograms, three distributions 🔴
+
+```bash
+cd labs/m05/5.5 && nvcc -O2 -arch=native histogram.cu -o histogram && ./histogram
+```
+
+<Callout type="note" title="Exercises">
+  1. Give `hist_private` the grid-stride loop but keep one byte per load. How much of the gain comes from the loop, and how much from `uchar4`?
+  2. Count the global atomics each kernel performs (add a counter, or compute it on the CPU). Plot time against atomics.
+  3. Change the histogram to 4,096 bins (16 KB of shared memory) with 256 threads per block. What changes in the clear and merge code?
+  4. Implement warp aggregation with `__match_any_sync` in `hist_global`. How much does it help on the skewed input?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="CUDA100" note="Days 8–25: histograms, shared-memory privatization and atomic contention." />
+  <SourceCard id="BGE" note="Ch 47: histogram as a parallel pattern with data-dependent writes." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why does the naive histogram get slower when 90% of the data falls into one bin?',
+      options: [
+        'Skewed data is not coalesced',
+        'More threads update the same address, and atomics on one address serialize',
+        'Shared memory overflows',
+        'The bins overflow',
+      ],
+      answer: 1,
+      explain: 'Contention on the hot bin forces those atomics to queue one after another in the L2.',
+    },
+    {
+      q: 'What is privatization?',
+      options: [
+        'Making the histogram private to the CPU',
+        'Each block (or warp) builds its own copy of the histogram in fast memory, then merges it into the global one',
+        'Using private registers instead of atomics',
+        'Hiding the histogram from other kernels',
+      ],
+      answer: 1,
+      explain: 'Updates go to the cheap private copy; only the merge touches global memory.',
+    },
+    {
+      q: 'With one byte per thread, privatization was slower on uniform data than on constant data. Why?',
+      options: [
+        'Uniform data has more contention',
+        'Each tiny block merges about 160 non-empty bins, so the merge does nearly as many global atomics as the naive kernel',
+        'Constant data is cached',
+        'Uniform data overflows the counters',
+      ],
+      answer: 1,
+      explain: 'Privatization only pays when each copy absorbs many more inputs than it has bins.',
+    },
+    {
+      q: 'A 128 K-bin vocabulary histogram does not fit in shared memory. Which is a reasonable approach?',
+      options: [
+        'Use 128 K blocks',
+        'Use global atomics and rely on L2: with many bins, contention is low',
+        'Use one thread',
+        'It is impossible on a GPU',
+      ],
+      answer: 1,
+      explain: 'Many distinct addresses is the fast case for global atomics, and 512 KB of counters fits in a modern L2.',
+    },
+  ]}
+/>

@@ -1,0 +1,197 @@
+---
+summary: A scan gives every element the sum of everything before it. It looks inherently serial, but it parallelizes in log2(n) steps, and it is the tool that turns "each thread decides how much to write" into "each thread knows where to write". This chapter steps through the two classic algorithms, then measures what really decides a scan's speed on a GPU, the number of passes over memory.
+duration: 30 min
+objectives:
+  - Define inclusive and exclusive scan, and compute them by hand
+  - Trace Hillis–Steele and Blelloch scans, and compare their steps and total work
+  - Build a scan of any length from block scans, and count its memory traffic
+  - Use scan for stream compaction, and recognize it in top-p sampling, MoE routing and cu_seqlens
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import ScanStepper from '../../../components/viz/ScanStepper.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+A **prefix sum**, or **scan**, replaces each element with the sum of all the elements up to it:
+
+| | | | | | |
+|:--|--:|--:|--:|--:|--:|
+| input | 3 | 1 | 7 | 0 | 4 |
+| **inclusive** scan | 3 | 4 | 11 | 11 | 15 |
+| **exclusive** scan | 0 | 3 | 4 | 11 | 11 |
+
+The exclusive scan is the inclusive one shifted right by one, starting at 0 (the identity). Any associative operator works, not only `+`.
+
+On a CPU, a scan is a loop where each step depends on the one before. It looks like the least parallel thing possible. It isn't.
+
+## Why it matters
+
+A scan answers the question **"where do I write?"**. Suppose each thread produces a variable number of outputs: some keep their element and
+some drop it, or some request 3 KV blocks and some request 7. An exclusive scan of the counts gives each thread its starting offset in a packed
+output array, with no atomics and in a deterministic order.
+
+In inference this shows up as:
+
+- **`cu_seqlens`.** Variable-length batches pack sequences end to end; the start of sequence $i$ is the exclusive scan of the lengths
+  ([9.4](/learn/m09/varlen-cu-seqlens)).
+- **Top-p sampling.** Sort the probabilities, take the inclusive scan, and keep tokens until it passes $p$ ([11.1](/learn/m11/sampling-strategies)).
+- **MoE routing.** Count the tokens sent to each expert, then scan the counts to get each expert's slice of a packed buffer
+  ([14.5](/learn/m14/moe-expert-parallelism)).
+- **Stream compaction.** Keep only the elements that pass a test, packed together. The lab does this at the end.
+
+## Two parallel algorithms
+
+<Figure label="fig. 5.4" caption="A scan of 16 elements, one parallel step at a time. Amber cells are read, blue cells are written. Compare how many parallel steps and how many additions each algorithm needs, against the 15 of each for a serial loop.">
+  <ScanStepper client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. Step through **Hillis–Steele**. After the step with offset $k$, each element holds the sum of the $2k$ elements ending at it. Check one.
+  2. Switch to **Blelloch** and step through the up-sweep. Compare it with the reduction tree in [5.1](/learn/m05/reduction-trees): it's the same tree, with the partial sums kept.
+  3. Compare the total additions: 49 against 30. With 16 elements the difference is small; with $n$ elements it is $n \log_2 n$ against $2n$.
+</Callout>
+
+**Hillis–Steele** (1986) adds, at step $k$, the element $2^k$ places to the left. After $\log_2 n$ steps every element has seen everything
+before it. It uses $n \log_2 n$ additions: more total work than the serial loop, but in the fewest parallel steps.
+
+**Blelloch** (1990) is **work-efficient**. It runs an up-sweep (a reduction tree that keeps its partial sums), sets the root to zero, then
+runs a down-sweep that passes prefixes back down the tree. It uses about $2n$ additions in $2 \log_2 n$ steps, and produces an
+exclusive scan.
+
+Inside a warp, Hillis–Steele wins: the 32 lanes exist anyway, so the extra additions are free, and a shuffle does each step in one
+instruction:
+
+```cpp
+// labs/m05/5.4/scan.cu
+__device__ int warp_inclusive_scan(int v) {
+    int lane = threadIdx.x % 32;
+    for (int off = 1; off < 32; off *= 2) {
+        int up = __shfl_up_sync(0xffffffff, v, off);   // value from lane - off
+        if (lane >= off) v += up;
+    }
+    return v;
+}
+```
+
+A block scan is then built the same way as the block reduction in [5.2](/learn/m05/warp-shuffles): scan each warp, scan the warp totals,
+and add each warp's offset back.
+
+## Scanning 16 million elements
+
+One block can only scan one tile, so a long array is scanned in three phases:
+
+1. **Scan each tile**, and write each tile's total to a small `sums` array.
+2. **Scan `sums`.** It is $n / \text{tile}$ long, so recurse with the same code.
+3. **Add** the scanned total of all earlier tiles to every element of each tile.
+
+The lab runs this with four different phase-1 block scans:
+
+```text title="output (RTX 3050 6GB Laptop)"
+Inclusive scan of 16777216 ints (67 MB in, 67 MB out):
+  phase 1 kernel     tile      time       GB/s
+  hillis-steele       512  2.371 ms       56.6  PASS
+  blelloch            512  2.431 ms       55.2  PASS
+  warp shuffle        512  2.180 ms       61.6  PASS
+  4 per thread       2048  2.193 ms       61.2  PASS
+  reduce-then-scan   2048  1.626 ms       82.6  PASS
+  cudaMemcpy D2D           1.097 ms      122.4  (the floor: read once, write once)
+```
+
+The four block algorithms land within 10% of each other, all at **twice** the copy time. Counting memory traffic shows why: phase 1 reads
+the input and writes the output, and phase 3 reads the output and writes it again. That is 4 trips through memory, against 2 for the copy.
+The block algorithm barely matters, because memory traffic sets the time.
+
+**Reduce-then-scan** reorganizes the phases. Phase 1 only *reads* each tile and writes its total. Phase 2 scans the totals. Phase 3 reads
+the input again, scans the tile, adds the offset and writes the result **once**. That makes 3 trips instead of 4, and the measured time
+drops by exactly that ratio, from 2.18 ms to 1.63 ms.
+
+<Callout type="insight" title="The production answer: one pass">
+  CUB's `DeviceScan` (and `torch.cumsum` on large GPU tensors) uses a **single-pass** scan with *decoupled look-back* (Merrill and Garland,
+  2016). Each tile publishes its total as soon as it is known, and the next tile waits only for its immediate predecessors' published values,
+  never for a separate pass. It reads the input once and writes the output once, reaching copy speed. It also needs the memory-ordering
+  care of the last-block pattern in [5.3](/learn/m05/atomics-and-cas). In real code, call CUB rather than writing your own.
+</Callout>
+
+## Stream compaction
+
+Keep the elements with `x > 2`, packed together and in their original order:
+
+```cpp
+flags[i] = x[i] > 2;                     // 1. 0 or 1 per element
+pos = inclusive_scan(flags);             // 2. pos[i] = how many kept elements up to and including i
+if (flags[i]) out[pos[i] - 1] = x[i];    // 3. scatter each kept element to its slot
+```
+
+```text title="output"
+Compaction (keep x > 2): kept 4195183 of 16777216 in 4.900 ms  PASS
+```
+
+At 4.9 ms this is slow: three separate kernels, a full array of flags written and read back, and a scan that makes three trips of its own.
+A fused version computes the flags while loading the tile and scatters while writing it, which brings it close to the cost of one scan.
+
+## Lab: four scans and a compaction 🔴
+
+```bash
+cd labs/m05/5.4 && nvcc -O2 -arch=native scan.cu -o scan && ./scan
+```
+
+<Callout type="note" title="Exercises">
+  1. Turn the inclusive scan into an exclusive one without another pass. (Hint: in `scan_with_offset`, what does each thread already know before adding its own value?)
+  2. Fuse `make_flags` into the reduce-then-scan kernels so the flags are never stored. How much faster is compaction?
+  3. Change `scan_4_per_thread` to 8 elements per thread (`int4` × 2). Does the bigger tile help?
+  4. If you have PyTorch with CUDA, time `torch.cumsum` on 16 M int32 values. How close is it to `cudaMemcpy`?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="CUDA100" note="Days 14–20: Hillis–Steele and Blelloch scans, and scans of arbitrary length." />
+  <SourceCard id="BGE" note="Ch 47: scan as a fundamental parallel primitive." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'What is the exclusive scan of [2, 5, 1, 3]?',
+      options: ['[2, 7, 8, 11]', '[0, 2, 7, 8]', '[0, 2, 5, 1]', '[11, 9, 4, 3]'],
+      answer: 1,
+      explain: 'Each element is the sum of all elements before it, starting from 0.',
+    },
+    {
+      q: 'Hillis–Steele uses about n log n additions, Blelloch about 2n. Why use Hillis–Steele inside a warp?',
+      options: [
+        'It is more accurate',
+        'The 32 lanes exist anyway, so the extra additions are free, and it needs half as many steps',
+        'Blelloch does not work for 32 elements',
+        'Shuffles can only shift left',
+      ],
+      answer: 1,
+      explain: 'When threads would otherwise idle, fewer steps matters more than less total work.',
+    },
+    {
+      q: 'The three-phase scan took twice as long as a copy. Why?',
+      options: [
+        'The block scan algorithm is slow',
+        'Data crosses memory four times (read, write, then read and write again in phase 3) against twice for a copy',
+        'Phase 2 is serial',
+        'Integers are slower than floats',
+      ],
+      answer: 1,
+      explain: 'All four block algorithms performed about the same; cutting a memory pass (reduce-then-scan) is what made it faster.',
+    },
+    {
+      q: 'Each of 1,000 threads produces between 0 and 5 outputs. How does a thread find where to write them in a packed array?',
+      options: [
+        'Each thread writes to its own index times 5',
+        'An exclusive scan of the counts gives each thread its starting offset',
+        'A global atomic counter, in a deterministic order',
+        'Sort the outputs afterwards',
+      ],
+      answer: 1,
+      explain: 'This is the core use of scan. (An atomic counter also works, but the order is not deterministic.)',
+    },
+  ]}
+/>

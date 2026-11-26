@@ -1,0 +1,221 @@
+---
+summary: Softmax is two reductions and a map, the patterns of this module put to work in one of the most-run operations in an LLM. This chapter writes it as three kernels, fuses it into one, derives the online softmax that FlashAttention is built on, and measures five versions on three row shapes, finding that the right kernel depends on how long the rows are.
+duration: 30 min
+objectives:
+  - Explain why softmax subtracts the row max, and show the overflow it prevents
+  - Count the memory traffic of a three-kernel softmax and of fused versions, and predict their speed
+  - Derive the online softmax update that computes max and sum in one pass
+  - Choose a block-per-row, warp-per-row or split-row layout from the row length
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Softmax turns a row of scores into probabilities. It runs over every row of attention scores in every layer
+([1.3](/learn/m01/attention-step-by-step)), and over the logits at the end of every decode step ([1.4](/learn/m01/autoregressive-generation)):
+
+$$
+y_i = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}}, \qquad m = \max_j x_j
+$$
+
+In terms of this module's patterns, it is a **max reduction** ([5.1](/learn/m05/reduction-trees)), then a **sum reduction** of
+exponentials, then an elementwise **map**.
+
+## Why subtract the max
+
+Mathematically, subtracting $m$ changes nothing: it multiplies the top and bottom of the fraction by $e^{-m}$. Numerically, it is
+essential. FP32 overflows at about $3.4 \times 10^{38} \approx e^{88.7}$, and logits of 90 or more are entirely normal:
+
+```text title="output (RTX 3050 6GB Laptop)"
+Logits 90 ... 100:
+  exp(x) / sum               nan     nan     nan     nan     nan     nan     nan     nan
+  exp(x - max) / sum      0.0000  0.0002  0.0016  0.0116  0.0316  0.0860  0.2337  0.6353
+```
+
+Without the max, $e^{100}$ becomes `inf`, `inf / inf` is `NaN`, and the whole row is lost. With it, the largest exponent is $e^0 = 1$, and
+nothing can overflow. In FP16, which overflows at 65,504 ≈ $e^{11}$, this matters even more.
+
+## Version 1: three kernels
+
+The direct translation launches one kernel per step:
+
+```cpp
+k_row_max  <<<rows, 256>>>(x, m, cols);        // m[r] = max of row r
+k_exp_sum  <<<rows, 256>>>(x, m, y, s, cols);  // y = exp(x - m[r]),  s[r] = sum of y
+k_normalize<<<rows, 256>>>(y, s, cols);        // y /= s[r]
+```
+
+Count the trips through memory. Kernel 1 reads the row. Kernel 2 reads it again and writes `y`. Kernel 3 reads `y` and writes it
+again. That is **3 reads and 2 writes**, plus 3 launches. The minimum is 1 read and 1 write.
+
+## Version 2: fuse into one kernel
+
+Give each row to **one block**, which does all three steps. The max and sum are block reductions with warp shuffles
+([5.2](/learn/m05/warp-shuffles)), and every thread needs the results, so they use the `xor` butterfly:
+
+```cpp
+// labs/m05/5.7/softmax.cu, k_fused3
+float v = -FLT_MAX;
+for (int c = threadIdx.x; c < cols; c += BLOCK) v = fmaxf(v, row[c]);
+float mx = block_reduce_max(v);                                         // pass 1: max
+float s = 0.0f;
+for (int c = threadIdx.x; c < cols; c += BLOCK) s += expf(row[c] - mx);
+float inv = 1.0f / block_reduce_sum(s);                                 // pass 2: sum
+for (int c = threadIdx.x; c < cols; c += BLOCK) out[c] = expf(row[c] - mx) * inv;   // pass 3: write
+```
+
+This still reads the row three times, but the intermediate `y` is never written, and if the row is short, the second and third reads come
+from cache.
+
+## Version 3: online softmax, one pass for max and sum
+
+Can the max and the sum be computed in a **single** pass? The problem is that the sum needs the max, which isn't known until the end. The
+trick (Milakov and Gimelshein, 2018) is to keep a running max $m$ and a running sum $d$ of $e^{x - m}$, and **rescale $d$ whenever the max
+changes**:
+
+$$
+m' = \max(m, x), \qquad d' = d \cdot e^{m - m'} + e^{x - m'}
+$$
+
+If a new element is larger than everything so far, the old sum was relative to the wrong max, and multiplying by $e^{m - m'}$ corrects it.
+Two partial results $(m_1, d_1)$ and $(m_2, d_2)$ merge the same way, so the per-thread states combine with an ordinary shuffle tree:
+
+$$
+m = \max(m_1, m_2), \qquad d = d_1 e^{m_1 - m} + d_2 e^{m_2 - m}
+$$
+
+That makes 2 reads (one for $(m, d)$, one to write the outputs) and 1 write.
+
+<Callout type="insight" title="This is the heart of FlashAttention">
+  Online softmax means the max and sum of a row can be built up **one block of columns at a time**, without ever holding the whole row.
+  FlashAttention ([8.5](/learn/m08/flashattention)) applies the same rescaling to the attention output itself. It processes K and V in
+  tiles, keeps a running $(m, d)$ and a running output for each query, and rescales them as each new tile changes the max. As a result, the
+  $n \times n$ score matrix is never written to memory. The same merge rule combines partial results across blocks in FlashDecoding
+  ([9.5](/learn/m09/split-kv-flash-decoding)).
+</Callout>
+
+## Version 4 and 5: keep the row on chip
+
+If the row fits in registers, load it **once**, compute max and sum from the registers, and write once: the minimum traffic. With 256 threads,
+a 1,024-element row is just 4 floats per thread (`k_registers`).
+
+For short rows, a whole block per row wastes threads. A 64-element row gives a 256-thread block only 64 elements to work on. Instead,
+give each row to **one warp**: 2 values per lane, reductions purely by shuffles, no shared memory and no `__syncthreads` (`k_warp_row`).
+
+## Measured
+
+"GB/s" counts only the minimum traffic, 1 read and 1 write, so it shows how close each kernel comes to a perfect one. This GPU reaches
+about 125 GB/s in practice.
+
+```text title="output (RTX 3050 6GB Laptop)"
+attention: 16384 rows x 1024 (67 MB)
+  3 kernels         2.725 ms    49.3 GB/s  PASS
+  fused 3-pass      1.107 ms   121.2 GB/s  PASS
+  online            1.130 ms   118.7 GB/s  PASS
+  registers         1.086 ms   123.5 GB/s  PASS
+  warp/row          1.089 ms   123.3 GB/s  PASS
+
+vocab: 64 rows x 128256 (33 MB)
+  3 kernels         1.347 ms    48.8 GB/s  PASS
+  fused 3-pass      1.056 ms    62.2 GB/s  PASS
+  online            0.801 ms    82.0 GB/s  PASS
+
+short: 262144 rows x 64 (67 MB)
+  3 kernels         6.624 ms    20.3 GB/s  PASS
+  fused 3-pass      3.995 ms    33.6 GB/s  PASS
+  online            6.734 ms    19.9 GB/s  PASS
+  warp/row          1.096 ms   122.5 GB/s  PASS
+```
+
+**Attention-shaped rows (1,024 wide).** Fusion gives **2.5×**. After that, every fused version is at the bandwidth limit. A 4 KB row is
+still in L1 when the second and third passes read it, so in practice even the 3-pass kernel reads DRAM only once.
+
+**Vocabulary rows (128,256 wide, a decode batch of 64).** Each row is 513 KB, far too big for L1, and 64 of them exceed the 2 MB L2. Now
+every extra pass really goes to DRAM, so **online beats 3-pass by 1.3×**, reading 2 rows instead of 3. Even online softmax reaches only 82
+GB/s, because there are only 64 blocks for 20 SMs. Production kernels split long rows across several blocks and merge their $(m, d)$ pairs
+with the rule above, as in [5.3](/learn/m05/atomics-and-cas)'s last-block pattern.
+
+**Short rows (64 wide).** Block-per-row kernels waste three quarters of their threads and spend most of their time in barriers. The online
+version is even slower than 3-pass here. Most likely, with at most one element per thread, the two extra `expf` in each merge step cost
+more than the memory pass they save. **Warp-per-row is 3.6× faster** than the best block kernel and runs at full bandwidth.
+
+<Callout type="insight" title="Pick the layout from the shape">
+  | Row length | Layout |
+  |:--|:--|
+  | up to ~1 K | one warp per row, row in registers |
+  | ~1 K to ~16 K | one block per row, row in registers or shared memory |
+  | longer (vocabulary, long-context attention) | split each row across blocks, online softmax, merge $(m, d)$ |
+
+  Real softmax kernels (PyTorch's, or the ones in vLLM and FlashInfer) choose among these at run time from the row length. Triton's tutorial
+  softmax ([8.6](/learn/m08/triton)) picks the block size from the row length for the same reason.
+</Callout>
+
+## And then, fuse it away
+
+The fastest softmax is one that never runs as its own kernel:
+
+- **Attention** fuses softmax into the attention kernel (FlashAttention), so the scores never reach memory at all.
+- **Sampling** fuses temperature scaling, softmax and top-k/top-p into one sampling kernel ([11.1](/learn/m11/sampling-strategies)). Greedy
+  decoding doesn't need the softmax at all, only the argmax.
+- **Training** fuses softmax with the cross-entropy loss, which is beyond this course.
+
+## Lab: five softmaxes, three shapes 🔴
+
+```bash
+cd labs/m05/5.7 && nvcc -O2 -arch=native softmax.cu -o softmax && ./softmax
+```
+
+<Callout type="note" title="Exercises">
+  1. Replace `expf` with the fast intrinsic `__expf` in the online kernel. Does the short-row result change? Is the output still within the test's tolerance?
+  2. Split each vocabulary row across 8 blocks: each block computes $(m, d)$ for its slice and writes it out, then a second kernel merges the 8 pairs and writes the outputs. How close to 125 GB/s does it get?
+  3. Add `bench<2048>` and `bench<4096>` to `main`. Warp-per-row is only compiled up to 32 values per lane; raise that limit. At what row length does it start losing to `registers`, and why? (Count the registers each lane needs.)
+  4. Write a softmax for FP16 input and output that computes in FP32 internally. How much faster is it, and why?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="CUDA100" note="Days 14–25: softmax kernels, fused reductions and online softmax." />
+  <SourceCard id="BGE" note="Ch 47: composing reductions and maps into fused kernels." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why does softmax subtract the row max before exponentiating?',
+      options: [
+        'It changes the result to be more accurate',
+        'It prevents exp() from overflowing to inf, which would turn the row into NaN, without changing the mathematical result',
+        'It makes the kernel faster',
+        'It is required for the sum reduction',
+      ],
+      answer: 1,
+      explain: 'exp(x − m) ≤ 1 for every element, and the e^(−m) factor cancels between numerator and denominator.',
+    },
+    {
+      q: 'How many times does the three-kernel softmax move each row through memory?',
+      options: ['1 read, 1 write', '2 reads, 1 write', '3 reads, 2 writes', '3 reads, 3 writes'],
+      answer: 2,
+      explain: 'Max reads x; exp-sum reads x and writes y; normalize reads y and writes it again.',
+    },
+    {
+      q: 'Online softmax has seen max m = 5 and sum d = 2 (relative to 5). The next element is 7. What are m and d now?',
+      options: ['m = 7, d = 3', 'm = 7, d = 2e^(−2) + 1', 'm = 5, d = 2 + e^2', 'm = 7, d = 2e^2 + 1'],
+      answer: 1,
+      explain: 'Rescale the old sum to the new max: d = 2·e^(5−7) + e^(7−7) = 2e^(−2) + 1.',
+    },
+    {
+      q: 'For 64-element rows, warp-per-row was 3.6× faster than the best block-per-row kernel. Why?',
+      options: [
+        'Warps have more registers',
+        'A 256-thread block has only 64 elements to work on, so most threads idle and barriers dominate; a warp fits the row with no barriers at all',
+        'Warp shuffles are more accurate',
+        'Short rows are not coalesced',
+      ],
+      answer: 1,
+      explain: 'Match the unit of parallelism to the row length.',
+    },
+  ]}
+/>

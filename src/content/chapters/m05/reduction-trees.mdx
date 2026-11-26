@@ -1,0 +1,195 @@
+---
+summary: A reduction turns many values into one. On a GPU it becomes a tree of pairwise combines, and the details of that tree decide which threads idle and how much memory traffic is in flight. This chapter walks through five versions of a sum and measures each one, including the textbook optimizations that no longer matter on modern hardware.
+duration: 25 min
+objectives:
+  - Explain why a parallel reduction takes log2(n) steps, and what it needs from the operator
+  - Compare interleaved and sequential addressing, and say what each costs
+  - Explain why giving each thread more elements matters more than polishing the tree
+  - "Recognize reductions inside LLM kernels: softmax, norms, attention and sampling"
+---
+import Callout from '../../../components/ui/Callout.astro';
+import Figure from '../../../components/ui/Figure.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import ReductionTree from '../../../components/viz/ReductionTree.tsx';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+A **reduction** combines many values into one: a sum, a max, a count. It shows up constantly in LLM inference. Every softmax needs the
+max and the sum of a row. Every RMSNorm needs a sum of squares. Every attention score is a dot product, which is a sum. And sampling has to
+find the largest logit, or the top k of them.
+
+A CPU does it with a loop: `for (i...) s += x[i]`. That is $n$ steps, each depending on the last. A GPU needs a different shape.
+
+## The tree
+
+Add pairs, then pairs of pairs. 256 values become 128 partial sums, then 64, and so on: one value after $\log_2 256 = 8$ steps. The total
+number of additions is still $n - 1$, the same as the loop, so no extra work is done. The work just runs side by side.
+
+The tree changes the *order* of operations, so it needs an **associative** operator: $(a \oplus b) \oplus c = a \oplus (b \oplus c)$. Sum,
+max, min, AND and OR all are. Floating-point addition only nearly is, so a tree sum can differ from a loop sum in the last bits (see
+[4.5](/learn/m04/races-and-correctness)).
+
+A large array has many blocks, and `__syncthreads` only works within one block ([4.4](/learn/m04/shared-memory-syncthreads)). So the usual
+plan has **two passes**: each block reduces its slice to one partial sum, then a second launch reduces the partials.
+
+## Three ways to lay out the tree
+
+The tree can be mapped onto threads in more than one way. Step through each layout below and watch which threads and warps do the work.
+
+<Figure label="fig. 5.1" caption="One step of a 32-element block reduction. Amber cells are read, blue cells are written. Below: which threads add at this step, grouped into warps (drawn with 8 lanes so they fit; real warps have 32). A warp with even one busy lane has to issue the instruction.">
+  <ReductionTree client:visible />
+</Figure>
+
+<Callout type="try" title="Try these">
+  1. In **v1**, step through all five steps. How many warps issue the instruction at step 3, when only 4 threads are working?
+  2. Switch to **v2**. The additions are the same, but which warps go idle, and how early?
+  3. Compare the **warp-steps, whole sum** total across the three kernels. That number counts the instructions the block actually issues.
+</Callout>
+
+- **v1, interleaved and divergent.** Thread `tid` works only if `tid % (2*s) == 0`. Busy threads end up scattered through every warp, so
+  all warps keep issuing while most of their lanes sit idle ([2.4](/learn/m02/warps-simt-branching)). The `%` is also slow.
+- **v2, interleaved and compact.** Pair number `tid` is handled by thread `tid`, so busy threads are packed together and whole warps
+  retire. But thread `tid` now touches address `2*s*tid`, and neighbouring lanes hit the same shared-memory banks: the cost moves from
+  divergence to **bank conflicts** ([6.4](/learn/m06/bank-conflicts)).
+- **v3, sequential addressing.** Fold the top half onto the bottom: `if (tid < s) s[tid] += s[tid + s]`. Busy threads are contiguous and
+  so are their addresses. This is the kernel from [4.4](/learn/m04/shared-memory-syncthreads).
+
+## Then: stop wasting the threads
+
+Even v3 wastes threads. Half of them are idle from the very first step, and each thread loads only one element. Two more changes:
+
+- **v4, add during the load.** Each thread loads two elements and adds them before the tree starts. That needs half as many blocks to
+  cover the array.
+- **v5, grid-stride + `float4`.** Launch only enough blocks to fill the GPU (here 8 per SM) and let each thread walk the array with a
+  grid-stride loop ([4.2](/learn/m04/thread-block-grid-indexing)), reading 16 bytes at a time and keeping a running sum in a register. The
+  tree then runs once per block at the very end, instead of once every 256 elements.
+
+```cpp
+// labs/m05/5.1/reduction.cu, v5
+float v = 0.0f;
+const float4* in4 = reinterpret_cast<const float4*>(in);
+for (int i = blockIdx.x * BLOCK + tid; i < n / 4; i += gridDim.x * BLOCK) {
+    float4 q = in4[i];
+    v += (q.x + q.y) + (q.z + q.w);       // most of the work: a private, serial sum
+}
+s[tid] = v;                               // then one shared-memory tree, as in v3
+__syncthreads();
+for (int stride = BLOCK / 2; stride > 0; stride /= 2) {
+    if (tid < stride) s[tid] += s[tid + stride];
+    __syncthreads();
+}
+```
+
+This mixes the two shapes: a **serial** loop inside each thread, where it is cheapest, and a **parallel** tree only across threads. Almost
+every fast reduction kernel works this way.
+
+## Measured
+
+A sum reads each byte once and does one addition per 4 bytes, an intensity of 0.25 FLOP/byte. It is completely memory-bound
+([3.2](/learn/m03/arithmetic-intensity)), so the goal is to read memory as fast as the GPU can.
+
+```text title="output (RTX 3050 6GB Laptop)"
+Sum of 33554432 floats (134 MB), two passes:
+  kernel                            time      GB/s         result
+  v1 interleaved, divergent     2.168 ms      61.9       33554430 PASS
+  v2 interleaved, compact       2.135 ms      62.9       33554430 PASS
+  v3 sequential addressing      2.136 ms      62.8       33554430 PASS
+  v4 add during load            1.080 ms     124.2       33554430 PASS
+  v5 grid-stride + float4       1.053 ms     127.5       33554430 PASS
+  CPU (double)                                           33554430
+
+  cudaMemcpy D2D of the same array: 122.7 GB/s (read + write)
+```
+
+This is not the textbook result. In the classic version of this exercise (Mark Harris's 2007 slides, on a G80 GPU), each change to the
+tree gave a large speedup. Here **v1, v2 and v3 run at the same speed**: across repeated runs they trade places between 60 and 80 GB/s.
+On a modern GPU the warp scheduler hides divergence and bank conflicts in such a short tree, as long as other warps have loads to
+issue.
+
+What *does* matter is **bytes in flight**. In v1–v3 every block loads 1 KB and then spends 8 barrier-separated steps in the tree, issuing no
+loads at all. Giving each thread a second element (v4) doubles the rate at once, and v5 reaches 127 GB/s. That is about as fast as this
+GPU reads memory in practice: a device-to-device copy, which also has to write, manages 123.
+
+<Callout type="insight" title="The lesson generalizes">
+  For memory-bound kernels, first ask whether there are enough loads in flight to cover memory latency (Little's law,
+  [2.5](/learn/m02/occupancy-latency-hiding)). Only then polish the arithmetic. Profilers report this directly as DRAM throughput as a
+  fraction of peak ([7.2](/learn/m07/nsight-systems-vs-compute)). Once a kernel is near that number, nothing else will help.
+</Callout>
+
+## Where reductions hide in an LLM
+
+| Kernel | Reduction | Over |
+|:--|:--|:--|
+| Softmax ([5.7](/learn/m05/softmax-kernels)) | max, then sum of exp | each row of scores or logits |
+| RMSNorm / LayerNorm ([8.1](/learn/m08/norms-fused-residual)) | sum of squares (and mean) | each token's hidden vector |
+| Attention ([8.4](/learn/m08/mha-kernel)) | dot products, then the softmax reductions | each query against all keys |
+| Greedy and top-k sampling ([11.1](/learn/m11/sampling-strategies)) | argmax, top-k | each row of logits, over ~128 K vocabulary entries |
+| Split-K / FlashDecoding ([9.5](/learn/m09/split-kv-flash-decoding)) | combine partial results from several blocks | one row split across blocks |
+
+Their rows are short (a few thousand elements) and there are many of them, so the usual layout is **one block, or one warp, per row**. The
+tree inside that block then runs very often, and making it cheap is the subject of the next chapter.
+
+## Lab: five reductions 🔴
+
+```bash
+cd labs/m05/5.1 && nvcc -O2 -arch=native reduction.cu -o reduction && ./reduction
+```
+
+<Callout type="note" title="Exercises">
+  1. Change `reduce_v5`'s grid from 8 blocks per SM to 1, 2, 4 and 32. Where does bandwidth stop improving? Relate the answer to occupancy ([2.5](/learn/m02/occupancy-latency-hiding)).
+  2. Turn v5 into a max reduction. What identity value replaces `0.0f`?
+  3. Make v4 load four elements per thread instead of two. How close does it get to v5?
+  4. The second pass uses one block to reduce 160 partials. Time it on its own. What fraction of the total is it?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="CUDA100" note="Days 8–13: reduction kernels, from the naive tree to grid-stride and multiple elements per thread." />
+  <SourceCard id="BGE" note="Ch 32: parallel reduction as the first pattern beyond map." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A block reduces 1,024 values with a tree. How many parallel steps does that take?',
+      options: ['1', '10', '512', '1,023'],
+      answer: 1,
+      explain: 'log2(1024) = 10 steps. The number of additions is still 1,023, spread over those 10 steps.',
+    },
+    {
+      q: 'Why can a tree reduction compute a max but not, in general, a mean of means?',
+      options: [
+        'max is faster',
+        'The tree reorders the operations, so the operator must be associative; an average of averages is not',
+        'max is an integer operation',
+        'Means need atomics',
+      ],
+      answer: 1,
+      explain: 'Averaging pairs, then averaging the results, only equals the true mean when every group is the same size. Sum first, then divide.',
+    },
+    {
+      q: 'In the lab, v1, v2 and v3 ran at about the same speed, and v4 was twice as fast. What does that say?',
+      options: [
+        'Divergence makes no difference to any kernel',
+        'The limit was too few loads in flight, not the cost of the tree itself',
+        'v4 has a bug',
+        'Shared memory is slower than global memory',
+      ],
+      answer: 1,
+      explain: 'While a block sits in its tree it issues no loads. More elements per thread keeps more memory requests outstanding.',
+    },
+    {
+      q: 'v5 launches only ~8 blocks per SM, however large the array. How does it cover all the data?',
+      options: [
+        'It doesn\'t; it samples',
+        'Each thread runs a grid-stride loop, summing many elements into a register before the block tree',
+        'It launches more kernels',
+        'It uses atomics on every element',
+      ],
+      answer: 1,
+      explain: 'The serial loop inside each thread does most of the work; the tree only combines the 256 per-thread sums.',
+    },
+  ]}
+/>

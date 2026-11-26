@@ -1,0 +1,213 @@
+---
+summary: Atomics let many threads update shared memory safely, but their speed depends almost entirely on how many threads hit the same address. Compare-and-swap builds any atomic you need, at a price that grows with contention. This chapter measures both and ends with a one-launch sum that gives the same bits every time.
+duration: 25 min
+objectives:
+  - Predict atomic throughput from the number of distinct addresses being updated
+  - Build an atomic operation the hardware lacks from atomicCAS, and explain when its loop retries
+  - Choose between hardware atomics, bit tricks and warp pre-reduction to cut contention
+  - Use the last-block pattern with __threadfence for a deterministic one-pass reduction
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+[4.5](/learn/m04/races-and-correctness) introduced atomics as the fix for a data race: `atomicAdd` makes a read-modify-write indivisible.
+This chapter is about what they cost and what to do when the operation you need doesn't exist.
+
+## Where atomics happen
+
+A global-memory atomic doesn't run on the SM. The SM sends the request to the **L2 cache**, and the L2 slice that owns the address does
+the read-modify-write itself. Two consequences:
+
+- Atomics on **different** addresses are spread over many L2 slices and run in parallel.
+- Atomics on the **same** address queue at one slice and run one after another.
+
+Shared-memory atomics run on the SM, are much cheaper, and only contend within one block.
+
+## Measured: contention is everything
+
+Each of 16 M threads adds to one of $K$ counters (thread $i$ uses counter $i \bmod K$):
+
+```text title="output (RTX 3050 6GB Laptop)"
+16777216 atomicAdds into K counters (thread i adds to counter i % K):
+           K       time     atomics / ns
+           1   9.220 ms              1.8  PASS
+           2   9.000 ms              1.9  PASS
+          32   1.420 ms             11.8  PASS
+        1024   0.527 ms             31.8  PASS
+       32768   0.525 ms             31.9  PASS
+     1048576   1.658 ms             10.1  PASS
+    16777216   1.660 ms             10.1  PASS
+```
+
+- **One address:** 1.8 atomics per nanosecond. Every update waits in line.
+- **1,024 to 32,768 addresses:** 32 per ns, **18× faster**. At this point the kernel is limited by reading its 64 MB of input
+  (0.527 ms ≈ 127 GB/s), not by the atomics at all.
+- **A million addresses or more:** back down to 10 per ns. The counters no longer fit in the 2 MB L2 cache, so each atomic also costs a
+  trip to DRAM.
+
+So, to make atomics fast, spread them out, but keep the target small enough to stay in cache. The histogram in
+[5.5](/learn/m05/histograms-privatization) is exactly this trade-off.
+
+## Compare-and-swap: build your own atomic
+
+CUDA has `atomicMax` for integers but not for floats. Every missing atomic can be built from one primitive:
+
+```cpp
+unsigned atomicCAS(unsigned* addr, unsigned compare, unsigned val);
+// atomically: old = *addr; if (old == compare) *addr = val; return old;
+```
+
+The recipe: read the current value, compute the new one, and swap it in **only if nobody changed the word meanwhile**. If someone did, CAS
+returns what is really there, and you try again with that.
+
+```cpp
+// labs/m05/5.3/atomics.cu
+__device__ float atomic_max_cas(float* addr, float val) {
+    unsigned* a = reinterpret_cast<unsigned*>(addr);
+    unsigned old = *a, assumed;
+    do {
+        assumed = old;
+        if (__uint_as_float(assumed) >= val) break;          // already big enough: don't write at all
+        old = atomicCAS(a, assumed, __float_as_uint(val));
+    } while (old != assumed);                                // lost the race: retry with the new value
+    return __uint_as_float(old);
+}
+```
+
+This is a **lock-free** loop: some thread always makes progress, and a thread retries only because another one succeeded. Its cost depends
+on the data:
+
+```text title="output"
+Max of 16777216 floats into one address:
+  CAS loop, random order                 0.559 ms  PASS  CAS retries: 6514
+  CAS loop, ascending order              7.291 ms  PASS  CAS retries: 1301020
+  integer atomicMax, ascending order     0.527 ms  PASS
+  warp max, then CAS, ascending order    1.086 ms  PASS
+```
+
+With random input, the running max quickly gets large, and almost every thread takes the early `break` without writing anything: 6,514
+retries in 16 M elements. With **ascending** input, every value is a new maximum, every thread tries to write, and 1.3 M CAS operations fail
+and retry. The same code runs 13× slower.
+
+Two ways out:
+
+- **A bit trick.** For non-negative floats, the IEEE-754 bit patterns sort in the same order as the values, so integer `atomicMax` on the
+  bits gives the float max, in one hardware atomic. (Negative values need the sign handled; see the exercises.)
+- **Reduce first.** A warp max with shuffles ([5.2](/learn/m05/warp-shuffles)) cuts the number of CAS loops 32×.
+
+Both work for many other cases too. Reduce locally first, and use an atomic only for the last step.
+
+<Callout type="warning" title="Don't build a spin lock">
+  CAS can also build a mutex: `while (atomicCAS(&lock, 0, 1) != 0);`. On a GPU this is a trap. If two lanes of the **same warp** compete,
+  the one spinning can keep the one holding the lock from ever running, and the kernel hangs. (Volta's independent thread scheduling makes
+  this survivable in some cases, but it is still slow and fragile.) Prefer lock-free updates of a single word, or restructure so that one
+  thread owns each piece of data.
+</Callout>
+
+## The last-block pattern: one launch, fixed order
+
+[5.2](/learn/m05/warp-shuffles) ended with a one-launch sum whose last bits changed from run to run, because blocks added their totals with
+`atomicAdd` in whatever order they finished. The fix uses an atomic only to decide **who goes last**, never to add floats:
+
+```cpp
+// labs/m05/5.3/atomics.cu
+float v = block_sum(grid_partial(x, n));
+__shared__ bool am_last;
+if (threadIdx.x == 0) {
+    partials[blockIdx.x] = v;
+    __threadfence();                                   // my partial is visible to every block before...
+    am_last = atomicAdd(ticket, 1) == gridDim.x - 1;   // ...I take a ticket
+}
+__syncthreads();
+if (am_last) {                                         // the last block sums all partials, in index order
+    float t = 0.0f;
+    for (int b = threadIdx.x; b < gridDim.x; b += BLOCK) t += partials[b];
+    t = block_sum(t);
+    if (threadIdx.x == 0) { *out = t; *ticket = 0; }
+}
+```
+
+`__threadfence()` makes this block's earlier writes visible to the whole GPU before anything it writes afterwards. Without it, the last block
+could take its ticket, read `partials[b]`, and see a stale value that hasn't reached L2 yet.
+
+```text title="output"
+One-launch float sum of 16777216 values, 6 runs each (bit patterns of the result):
+  atomicAdd per block    4b0002c3 4b0002c4 4b0002c3 4b0002c3 4b0002c1 4b0002c2
+  last-block pattern     4b0002c1 4b0002c1 4b0002c1 4b0002c1 4b0002c1 4b0002c1
+```
+
+The same input now gives the same bits on every run.
+
+<Callout type="insight" title="Determinism in inference engines">
+  The same pattern, with partial results combined in a fixed order, is how split-K matmuls and FlashDecoding
+  ([9.5](/learn/m09/split-kv-flash-decoding)) can be made reproducible. Engines that offer "batch-invariant" or deterministic modes go
+  further. Without them, the reduction split and order can depend on how many requests share the batch, so the same prompt can produce
+  different tokens depending on what else the server was doing.
+</Callout>
+
+## Lab: contention, CAS and determinism 🔴
+
+```bash
+cd labs/m05/5.3 && nvcc -O2 -arch=native atomics.cu -o atomics && ./atomics
+```
+
+<Callout type="note" title="Exercises">
+  1. Make `max_int_trick` work for negative floats. Hint: map each float's bits to an unsigned that sorts in the same order (non-negative: set the sign bit; negative: flip all the bits), use `atomicMax` on unsigned, and map back.
+  2. Use `atomicCAS` to build an atomic multiply for floats. Test it on 1,000 threads each multiplying by 1.0001.
+  3. Remove the `__threadfence()` from `sum_last_block` and run it many times. You may never see it fail. Why is it still a bug?
+  4. Add a K = 2 M row to the contention table. At what K does throughput fall, and how does that compare with your GPU's L2 size?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="CUDA100" note="Days 8–25: atomics, compare-and-swap and contention." />
+  <SourceCard id="BGE" note="Ch 32: atomics as the alternative to tree reductions, and their cost." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: '16 M threads each atomicAdd into one of K counters. Which K is fastest?',
+      options: ['K = 1', 'K in the thousands: many addresses, all fitting in L2', 'K = 16 M', 'K does not matter'],
+      answer: 1,
+      explain: 'Few addresses serialize; too many overflow the L2 cache. In between, atomics spread across L2 slices and stay cached.',
+    },
+    {
+      q: 'Why does the CAS-loop max run 13× slower on ascending input than on random input?',
+      options: [
+        'Sorted data is not coalesced',
+        'Every value is a new maximum, so every thread tries to write, and most CAS attempts fail and retry',
+        'atomicCAS is slower on sorted data',
+        'The compiler cannot vectorize it',
+      ],
+      answer: 1,
+      explain: 'With random data most threads see a larger running max and skip the write entirely.',
+    },
+    {
+      q: 'In the last-block pattern, what is the atomic used for?',
+      options: [
+        'Adding the partial sums',
+        'Deciding which block finishes last; that block then adds the partials in a fixed order',
+        'Locking the output',
+        'Synchronizing threads within a block',
+      ],
+      answer: 1,
+      explain: 'Only an integer ticket is atomic. The floating-point additions happen in index order, so the result is reproducible.',
+    },
+    {
+      q: 'What can go wrong if the __threadfence() is removed?',
+      options: [
+        'Nothing',
+        'The last block may read a partial that another block wrote but that is not yet visible, giving a wrong sum',
+        'The kernel will not compile',
+        'The ticket overflows',
+      ],
+      answer: 1,
+      explain: 'The fence orders a block\'s partial write before its ticket increment, as seen by the other blocks.',
+    },
+  ]}
+/>
