@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Inference Engineering, from Scratch — trailer</title>
+<style>
+  @font-face { font-family: 'Fraunces'; src: url(fonts/fraunces-latin-wght-normal.woff2) format('woff2'); font-weight: 100 900; font-style: normal; }
+  @font-face { font-family: 'Fraunces'; src: url(fonts/fraunces-latin-wght-italic.woff2) format('woff2'); font-weight: 100 900; font-style: italic; }
+  @font-face { font-family: 'JBM'; src: url(fonts/jetbrains-mono-latin-wght-normal.woff2) format('woff2'); font-weight: 100 800; }
+  @font-face { font-family: 'Serif4'; src: url(fonts/source-serif-4-latin-wght-normal.woff2) format('woff2'); font-weight: 200 900; }
+  html, body { margin: 0; height: 100%; background: #07090d; overflow: hidden; }
+  body { display: grid; place-items: center; }
+  canvas { width: min(100vw, 177.78vh); height: auto; display: block; }
+  body.render canvas { width: 1920px; }
+</style>
+</head>
+<body>
+<canvas id="cv" width="1920" height="1080"></canvas>
+<script>
+/* ───────────────────────── setup ───────────────────────── */
+const W = 1920, H = 1080, D = 80;
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const C = {
+  paper: '#121720', paper2: '#19202b', paper3: '#222b38', ink: '#ebe5d6', soft: '#a9a293',
+  faint: '#767063', rule: '#2d3644', blue: '#84adff', red: '#ff8a78', green: '#73d39b',
+  amber: '#f0c06a', violet: '#b6a0ff', teal: '#6fd8d0',
+};
+const PAL = [C.blue, C.teal, C.violet, C.amber, C.green];
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+const lerp = (a, b, p) => a + (b - a) * p;
+const eo = x => 1 - Math.pow(1 - x, 3);
+const eio = x => x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+const eback = x => { if (x <= 0) return 0; const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); };
+function rgba(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`;
+}
+function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+const FAM = { d: 'Fraunces', m: 'JBM', s: 'Serif4' };
+function font(size, weight = 500, fam = 'd', italic = false) { return `${italic ? 'italic ' : ''}${weight} ${size}px ${FAM[fam]}`; }
+function measure(str, f) { ctx.save(); ctx.font = f; const w = ctx.measureText(str).width; ctx.restore(); return w; }
+function T(str, x, y, o = {}) {
+  ctx.save();
+  ctx.globalAlpha *= (o.a ?? 1);
+  ctx.font = o.f || font(32);
+  ctx.fillStyle = o.c || C.ink;
+  ctx.textAlign = o.align || 'left';
+  ctx.textBaseline = o.base || 'alphabetic';
+  if (o.ls) ctx.letterSpacing = o.ls + 'px';
+  if (o.glow) { ctx.shadowColor = o.glow; ctx.shadowBlur = o.blur || 24; }
+  ctx.fillText(str, x, y);
+  ctx.restore();
+}
+function rr(x, y, w, h, r, fill, stroke, lw = 2) {
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, r);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+}
+function line(x1, y1, x2, y2, col, lw = 2, dash) {
+  ctx.save(); ctx.strokeStyle = col; ctx.lineWidth = lw; if (dash) ctx.setLineDash(dash);
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); ctx.restore();
+}
+
+/* grain tiles */
+const grain = [0, 1, 2, 3].map(k => {
+  const g = document.createElement('canvas'); g.width = g.height = 256;
+  const gx = g.getContext('2d'); const im = gx.createImageData(256, 256); const r = mulberry(99 + k);
+  for (let i = 0; i < im.data.length; i += 4) { const v = r() * 255; im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255; }
+  gx.putImageData(im, 0, 0); return g;
+});
+const logo = new Image(); logo.src = 'logo-128.png';
+
+/* ───────────────────────── shared pieces ───────────────────────── */
+function background(t) {
+  ctx.fillStyle = '#0d1118'; ctx.fillRect(0, 0, W, H);
+  const lift = 0.25 + 0.75 * seg(t, 6.5, 9.5);
+  // drifting blobs (site's teal / violet glow)
+  const blobs = [[C.teal, 520 + 140 * Math.sin(t * 0.11), 380 + 80 * Math.cos(t * 0.09), 620], [C.violet, 1420 + 120 * Math.cos(t * 0.08), 720 + 90 * Math.sin(t * 0.12), 680], [C.amber, 960 + 300 * Math.sin(t * 0.05), 980, 520]];
+  for (const [c, x, y, r] of blobs) {
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, rgba(c, 0.09 * lift)); g.addColorStop(1, rgba(c, 0));
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+  // blueprint grid
+  ctx.save(); ctx.globalAlpha = lift;
+  const off = (t * 6) % 48;
+  ctx.strokeStyle = 'rgba(122,167,255,0.045)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let x = -48 + off; x < W + 48; x += 48) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = -48 + off * 0.5; y < H + 48; y += 48) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke(); ctx.restore();
+}
+function finish(t) {
+  // vignette
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 1.05);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.62)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // grain
+  ctx.save(); ctx.globalAlpha = 0.05; ctx.globalCompositeOperation = 'screen';
+  const p = ctx.createPattern(grain[Math.floor(t * 24) % 4], 'repeat');
+  ctx.fillStyle = p; ctx.fillRect(0, 0, W, H); ctx.restore();
+  // letterbox in the cold open
+  const bar = 120 * (1 - eio(seg(t, 7.6, 9.0)));
+  if (bar > 0.5) { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, bar); ctx.fillRect(0, H - bar, W, bar); }
+  // fade in from black, out to black
+  const blk = Math.max(1 - seg(t, 0, 0.8), seg(t, D - 1.4, D - 0.2));
+  if (blk > 0) { ctx.fillStyle = `rgba(0,0,0,${blk})`; ctx.fillRect(0, 0, W, H); }
+}
+function label(num, name, lt) {
+  const a = eo(seg(lt, 0.1, 0.7));
+  T(num, 160, 172, { f: font(22, 600, 'm'), c: C.amber, a, ls: 2 });
+  line(212, 165, 212 + 48 * a, 165, rgba(C.amber, 0.7 * a), 2);
+  T(name, 280, 172, { f: font(22, 500, 'm'), c: C.soft, a, ls: 5 });
+}
+// words: array of [text, color?, italic?]
+function headline(str, lt, o = {}) {
+  const size = o.size || 60, y = o.y || 262, start = o.start ?? 0.35;
+  const parts = str.split(' ').map(w => {
+    const em = w.startsWith('*');
+    const tx = w.replace(/\*/g, '');
+    return { tx, em, f: font(size, em ? 500 : 480, 'd', em) };
+  });
+  const sp = measure(' ', font(size));
+  const total = parts.reduce((s, p) => s + measure(p.tx, p.f), 0) + sp * (parts.length - 1);
+  let x = o.align === 'center' ? (W - total) / 2 : (o.x || 160);
+  parts.forEach((p, i) => {
+    const q = eo(seg(lt, start + i * 0.055, start + i * 0.055 + 0.55));
+    T(p.tx, x, y + (1 - q) * 26, { f: p.f, c: p.em ? C.amber : C.ink, a: q });
+    x += measure(p.tx, p.f) + sp;
+  });
+}
+function caption(str, lt, start, y = 990) {
+  const a = eo(seg(lt, start, start + 0.7));
+  T(str, W / 2, y + (1 - a) * 14, { f: font(34, 400, 's'), c: C.soft, a, align: 'center' });
+}
+function chip(x, y, w, h, col, a = 1, fillA = 0.14) {
+  ctx.save(); ctx.globalAlpha *= a; rr(x, y, w, h, 12, rgba(col, fillA), rgba(col, 0.85), 2); ctx.restore();
+}
+
+/* ───────────────────────── events (for the soundtrack) ───────────────────────── */
+const EVENTS = [];
+const ev = (t, type, p = 0) => EVENTS.push({ t: +t.toFixed(3), type, p });
+
+/* ───────────────────────── scenes ───────────────────────── */
+const S = [];
+const scene = (s, e, draw) => S.push({ s, e, draw });
+
+/* 1 · cold open */
+const Q = 'Why does a chatbot write one word at a time?';
+const ANS = ['Because', ' every', ' word', ' is', ' a', ' trip', ' through', ' memory.'];
+const ANS_T = ANS.map((_, i) => 3.7 + i * 0.36);
+ANS_T.forEach((t, i) => ev(t, 'tick', i));
+for (let i = 0; i < Q.length; i++) ev(0.6 + (i / Q.length) * 2.4, 'key', i);
+scene(0, 8, (t, lt) => {
+  const n = Math.floor(seg(t, 0.6, 3.0) * Q.length);
+  const qf = font(42, 400, 'm');
+  const qw = measure(Q, qf);
+  const qx = (W - qw) / 2 + 24;
+  T('›', qx - 48, 430, { f: qf, c: C.amber });
+  T(Q.slice(0, n), qx, 430, { f: qf, c: C.soft });
+  const cx = qx + measure(Q.slice(0, n), qf) + 6;
+  if (t < 3.4 && Math.floor(t * 2.2) % 2 === 0) { ctx.fillStyle = C.amber; ctx.fillRect(cx, 396, 20, 42); }
+  // answer, token by token
+  const af = font(76, 450, 'd'), afe = font(76, 500, 'd', true);
+  const widths = ANS.map((w, i) => measure(w, i === ANS.length - 1 ? afe : af));
+  let x = (W - widths.reduce((a, b) => a + b, 0)) / 2;
+  ANS.forEach((w, i) => {
+    const p = seg(t, ANS_T[i], ANS_T[i] + 0.28);
+    if (p > 0) {
+      const last = i === ANS.length - 1;
+      const glow = 1 - seg(t, ANS_T[i], ANS_T[i] + 0.9);
+      if (glow > 0) {
+        const lead = w.startsWith(' ') ? measure(' ', af) : 0;
+        ctx.save(); ctx.globalAlpha *= glow * 0.9;
+        rr(x + lead - 6, 520, widths[i] - lead + 12, 96, 14, rgba(C.amber, 0.12), rgba(C.amber, 0.5), 1.5);
+        ctx.restore();
+      }
+      T(w, x, 594 + (1 - eo(p)) * 18, { f: last ? afe : af, c: last ? C.amber : C.ink, a: eo(p), glow: last ? rgba(C.amber, 0.5) : null });
+    }
+    x += widths[i];
+  });
+  caption('…and that one fact is the whole engineering problem.', t, 6.7, 720);
+});
+
+/* 2 · title */
+ev(8.55, 'boom');
+scene(8, 14.2, (t, lt) => {
+  // dust
+  const r = mulberry(7);
+  for (let i = 0; i < 70; i++) {
+    const x = r() * W, y = (r() * H - lt * (8 + r() * 18)) % H, s = 1 + r() * 2;
+    ctx.fillStyle = rgba(C.amber, 0.12 + 0.2 * r()); ctx.fillRect(x, (y + H) % H, s, s);
+  }
+  const la = eo(seg(lt, 0.2, 1.0));
+  if (logo.complete) { ctx.save(); ctx.globalAlpha *= la; ctx.drawImage(logo, W / 2 - 52, 250 + (1 - la) * 20, 104, 104); ctx.restore(); }
+  const reveal = (p, y, draw) => { ctx.save(); ctx.beginPath(); ctx.rect(0, y - 140, W * eio(p), 190); ctx.clip(); draw(); ctx.restore(); };
+  const p1 = seg(lt, 0.5, 1.7), p2 = seg(lt, 1.0, 2.2);
+  reveal(p1, 530, () => T('Inference Engineering,', W / 2, 530, { f: font(124, 560), align: 'center', a: 0.4 + 0.6 * p1 }));
+  reveal(p2, 676, () => T('from Scratch', W / 2, 676, { f: font(124, 480, 'd', true), c: C.amber, align: 'center', glow: rgba(C.amber, 0.35), blur: 40 }));
+  const rl = eio(seg(lt, 1.9, 2.9));
+  line(W / 2 - 330 * rl, 738, W / 2 + 330 * rl, 738, rgba(C.ink, 0.35), 1.5);
+  T('How large language models are served — from GPU memory to KV caches, batching and routing.', W / 2, 812,
+    { f: font(34, 400, 's'), c: C.soft, align: 'center', a: eo(seg(lt, 2.4, 3.3)) });
+  T('A FREE, OPEN FIELD GUIDE · BEGINNER TO EXPERT', W / 2, 880, { f: font(20, 500, 'm'), c: C.faint, align: 'center', ls: 5, a: eo(seg(lt, 3.0, 3.8)) });
+});
+
+/* 3 · tokens */
+const TK = ['Inf', 'erence', ' engineer', 'ing', ' is', ' fun'];
+const TK_ID = [18943, 1945, 24771, 278, 318, 1257];
+ev(14 + 2.3, 'swish'); ev(14 + 6.25, 'tick', 5);
+[0, 1, 2, 3, 4].forEach(i => ev(14 + 3.4 + i * 0.09, 'blip', i));
+scene(14, 22.2, (t, lt) => {
+  label('01', 'TOKENS', lt);
+  headline("Models don't read words. They read *tokens.*", lt);
+  const f = font(80, 450), pad = 26, gap = 18, y = 500;
+  const wj = TK.map(w => measure(w, f)), wt = TK.map(w => measure(w.trim(), f));
+  const sw = measure(' ', f);
+  const jTot = wj.reduce((a, b) => a + b, 0), cTot = wt.reduce((a, b) => a + b + pad * 2, 0) + gap * (TK.length - 1);
+  let jx = (W - jTot) / 2, cx = (W - cTot) / 2;
+  const split = eio(seg(lt, 2.2, 3.2));
+  const mb = { x: W / 2 - 200, y: 700, w: 400, h: 110 };
+  const into = eio(seg(lt, 4.6, 5.4));
+  const boxA = eo(seg(lt, 4.2, 4.8));
+  // model box
+  ctx.save(); ctx.globalAlpha *= boxA;
+  const pulse = seg(lt, 5.2, 5.6) * (1 - seg(lt, 5.8, 6.6));
+  rr(mb.x, mb.y, mb.w, mb.h, 18, rgba(C.violet, 0.1 + 0.25 * pulse), rgba(C.violet, 0.8), 2);
+  if (pulse > 0) { ctx.save(); ctx.shadowColor = C.violet; ctx.shadowBlur = 50 * pulse; rr(mb.x, mb.y, mb.w, mb.h, 18, null, rgba(C.violet, pulse), 3); ctx.restore(); }
+  T('THE MODEL', W / 2, mb.y + 68, { f: font(30, 600, 'm'), c: C.violet, align: 'center', ls: 6 });
+  ctx.restore();
+  TK.forEach((w, i) => {
+    const isNew = i === TK.length - 1;
+    const jc = jx + (w.startsWith(' ') ? sw : 0) + wt[i] / 2;
+    const cc = cx + pad + wt[i] / 2;
+    jx += wj[i]; cx += wt[i] + pad * 2 + gap;
+    const xc = lerp(jc, cc, split);
+    const col = isNew ? C.amber : PAL[i % 4];
+    if (isNew) {
+      const p = eio(seg(lt, 5.8, 6.6));
+      if (p <= 0) return;
+      const yy = lerp(mb.y + 40, y, p), xx = lerp(W / 2, xc, p);
+      chip(xx - wt[i] / 2 - pad, yy - 72, wt[i] + pad * 2, 98, col, 1, 0.2);
+      T(w.trim(), xx, yy, { f: font(80, 500, 'd', true), c: col, align: 'center', glow: rgba(C.amber, 0.6) });
+      T('next token', xx, yy + 70, { f: font(22, 500, 'm'), c: C.amber, align: 'center', a: seg(lt, 6.6, 7.0) });
+      return;
+    }
+    const a = eo(seg(lt, 1.0, 1.8));
+    if (split > 0) chip(xc - wt[i] / 2 - pad, y - 72, wt[i] + pad * 2, 98, col, split);
+    T(w.trim(), xc, y, { f, c: split > 0.5 ? col : C.ink, align: 'center', a });
+    // ids
+    const ia = eo(seg(lt, 3.4 + i * 0.09, 3.9 + i * 0.09));
+    if (ia > 0 && into < 1) {
+      const iy = lerp(600, mb.y + 60, into), ix = lerp(xc, W / 2, into);
+      ctx.save(); ctx.globalAlpha *= 1 - into;
+      line(xc, y + 32, xc, y + 32 + 30 * ia, rgba(col, 0.6), 1.5);
+      T(String(TK_ID[i]), ix, iy + (1 - ia) * 10, { f: font(30, 500, 'm'), c: col, align: 'center', a: ia });
+      ctx.restore();
+    }
+  });
+  caption('Text → token IDs → the model predicts the next token. Then it does it again.', lt, 2.4);
+  T('token IDs are illustrative', W - 160, 172, { f: font(18, 400, 'm'), c: C.faint, align: 'right', a: seg(lt, 3.6, 4.2) * (1 - into) });
+});
+
+/* 4 · memory wall */
+const MW_OUT = ['The', ' sky', ' is', ' blue', ' because'];
+const MW_P = 1.45, MW_S = 2.0;
+MW_OUT.forEach((_, i) => ev(22 + MW_S + (i + 1) * MW_P, 'tick', i + 2));
+scene(22, 32.2, (t, lt) => {
+  label('02', 'THE MEMORY WALL', lt);
+  headline('To write *one* token, the GPU reads *every* weight.', lt);
+  const A = eo(seg(lt, 0.6, 1.4));
+  ctx.save(); ctx.globalAlpha *= A;
+  // HBM stack
+  const hx = 190, hy = 380, hw = 430;
+  const cyc = lt < MW_S ? -1 : ((lt - MW_S) % MW_P) / MW_P;
+  for (let k = 0; k < 8; k++) {
+    const y = hy + 40 + k * 44;
+    const on = cyc >= 0 && Math.floor(cyc * 8) === k;
+    rr(hx, y, hw, 34, 6, on ? rgba(C.teal, 0.35) : rgba(C.blue, 0.07), on ? C.teal : rgba(C.blue, 0.45), on ? 2.5 : 1.5);
+    T(`layers ${k * 4 + 1}–${k * 4 + 4}`, hx + 18, y + 24, { f: font(17, 500, 'm'), c: on ? C.ink : C.faint });
+  }
+  T('HBM · MODEL WEIGHTS', hx, hy, { f: font(20, 600, 'm'), c: C.blue, ls: 3 });
+  T('14 GB', hx, hy + 452, { f: font(56, 560), c: C.ink });
+  T('7B params × 2 bytes (FP16)', hx, hy + 492, { f: font(20, 400, 'm'), c: C.faint });
+  // cores
+  const gx = 1300, gy = 420, n = 12, cs = 26, cg = 8;
+  const flash = cyc >= 0 ? Math.max(0, 1 - Math.min(cyc, 1 - cyc + 1) * 1) : 0;
+  const hot = cyc >= 0 && cyc > 0.9 ? (cyc - 0.9) / 0.1 : (cyc >= 0 && cyc < 0.12 && lt > MW_S + MW_P ? 1 - cyc / 0.12 : 0);
+  T('COMPUTE CORES', gx, hy, { f: font(20, 600, 'm'), c: C.green, ls: 3 });
+  const rnd = mulberry(3);
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+    const flick = rnd();
+    const b = hot * (0.6 + 0.4 * flick);
+    rr(gx + c * (cs + cg), gy + r * (cs + cg) - 6, cs, cs, 4, rgba(C.green, 0.06 + 0.6 * b), rgba(C.green, 0.25 + 0.6 * b), 1);
+  }
+  T(hot > 0.2 ? 'math: done in a blink' : 'waiting for data…', gx, hy + 470, { f: font(20, 400, 'm'), c: hot > 0.2 ? C.green : C.faint });
+  // bus
+  const bx1 = hx + hw + 20, bx2 = gx - 30, by = 590;
+  rr(bx1, by - 26, bx2 - bx1, 52, 26, rgba(C.teal, 0.05), rgba(C.teal, 0.3), 1.5);
+  T('memory bus · ~1 TB/s', (bx1 + bx2) / 2, by - 44, { f: font(20, 500, 'm'), c: C.teal, align: 'center' });
+  const pr = mulberry(11);
+  for (let i = 0; i < 90; i++) {
+    const sp = 0.25 + pr() * 0.2, ph = pr(), yy = by + (pr() - 0.5) * 34;
+    const u = (ph + lt * sp) % 1;
+    const xx = lerp(bx1 + 10, bx2 - 10, u);
+    const fade = Math.sin(u * Math.PI);
+    ctx.fillStyle = rgba(C.teal, 0.75 * fade * seg(lt, 1.2, 2.0));
+    ctx.beginPath(); ctx.arc(xx, yy, 2.2 + pr() * 1.8, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+  // output tokens + counter
+  const bx1g = 190 + 430 + 20, bx2g = 1300 - 30;
+  const done = lt < MW_S ? 0 : Math.min(MW_OUT.length, Math.floor((lt - MW_S) / MW_P));
+  const of = font(44, 460);
+  let ox = 700;
+  MW_OUT.forEach((w, i) => {
+    const ti = MW_S + (i + 1) * MW_P;
+    const p = eo(seg(lt, ti, ti + 0.3));
+    if (p > 0) T(w, ox, 880 + (1 - p) * 12, { f: of, a: p, c: i === done - 1 ? C.amber : C.ink });
+    ox += measure(w, of);
+  });
+  T(`${done} token${done === 1 ? '' : 's'}  ·  ${done * 14} GB moved`, 700, 810, { f: font(22, 500, 'm'), c: C.amber, a: seg(lt, MW_S, MW_S + 0.5) });
+  T('≈ 14 ms per token, just to move the weights', (bx1g + bx2g) / 2, 680, { f: font(22, 400, 'm'), c: C.soft, align: 'center', a: seg(lt, 4.2, 4.8) });
+  caption('Math is fast. Moving bytes is slow. Generating text is memory-bound.', lt, 6.3, 985);
+});
+
+/* 5 · prefill & decode */
+const PD_DEC = 12, PD_T0 = 2.5, PD_DT = 0.4;
+ev(32 + 1.3, 'swish');
+for (let i = 0; i < PD_DEC; i++) ev(32 + PD_T0 + i * PD_DT, 'tick', i % 5);
+scene(32, 40.2, (t, lt) => {
+  label('03', 'PREFILL & DECODE', lt);
+  headline('Read the prompt *at once.* Write the answer *one token at a time.*', lt, { size: 54 });
+  const ax0 = 200, ax1 = 1720, ay = 720;
+  const A = eo(seg(lt, 0.6, 1.2));
+  line(ax0, ay, ax0 + (ax1 - ax0) * eio(seg(lt, 0.6, 1.6)), ay, rgba(C.ink, 0.4), 2);
+  T('time →', ax1, ay + 40, { f: font(20, 500, 'm'), c: C.faint, align: 'right', a: A });
+  // prefill: 10 prompt tokens processed in parallel
+  const pp = eback(seg(lt, 1.2, 1.9));
+  for (let k = 0; k < 10; k++) {
+    const h = 22, y = ay - 14 - (k + 1) * (h + 5);
+    ctx.save(); ctx.globalAlpha *= clamp(pp);
+    rr(ax0 + 30, y + (1 - clamp(pp)) * 40, 150, h, 6, rgba(C.blue, 0.22), rgba(C.blue, 0.85), 1.5);
+    ctx.restore();
+  }
+  T('PREFILL', ax0 + 105, ay + 48, { f: font(24, 600, 'm'), c: C.blue, align: 'center', ls: 3, a: seg(lt, 1.5, 2.0) });
+  T('all at once', ax0 + 105, ay + 80, { f: font(19, 400, 'm'), c: C.faint, align: 'center', a: seg(lt, 1.6, 2.1) });
+  T('compute-bound', ax0 + 105, ay + 108, { f: font(19, 400, 'm'), c: C.blue, align: 'center', a: seg(lt, 1.7, 2.2) });
+  // decode tokens
+  const dx0 = ax0 + 300, step = 95;
+  for (let i = 0; i < PD_DEC; i++) {
+    const ti = PD_T0 + i * PD_DT, p = eback(seg(lt, ti, ti + 0.3));
+    if (p <= 0) continue;
+    const x = dx0 + i * step;
+    ctx.save(); ctx.globalAlpha *= clamp(p);
+    rr(x, ay - 46 - (1 - clamp(p)) * 20, 74, 32, 7, rgba(C.red, 0.2), rgba(C.red, 0.9), 1.5);
+    ctx.restore();
+  }
+  const da = seg(lt, PD_T0 + 0.2, PD_T0 + 0.8);
+  T('DECODE', dx0 + 37, ay + 48, { f: font(24, 600, 'm'), c: C.red, ls: 3, a: da, align: 'center' });
+  T('one token per step · each step re-reads the weights', dx0, ay + 80, { f: font(19, 400, 'm'), c: C.faint, a: da });
+  T('memory-bound', dx0, ay + 108, { f: font(19, 400, 'm'), c: C.red, a: da });
+  // TTFT bracket
+  const ta = eo(seg(lt, PD_T0 + 0.4, PD_T0 + 1.0));
+  if (ta > 0) {
+    const x2 = dx0 + 74, yb = 392;
+    ctx.save(); ctx.globalAlpha *= ta;
+    line(ax0, yb, ax0 + (x2 - ax0) * ta, yb, C.amber, 2.5);
+    line(ax0, yb - 12, ax0, yb + 12, C.amber, 2.5); line(x2, yb - 12, x2, yb + 12, C.amber, 2.5);
+    line(x2, yb + 12, x2, ay - 50, rgba(C.amber, 0.35), 1.5, [5, 6]);
+    T('TTFT', ax0, yb - 24, { f: font(30, 700, 'm'), c: C.amber });
+    T('time to first token', ax0 + 96, yb - 24, { f: font(22, 400, 'm'), c: C.soft });
+    ctx.restore();
+  }
+  // TPOT bracket
+  const pa = eo(seg(lt, PD_T0 + 2.0, PD_T0 + 2.6));
+  if (pa > 0) {
+    const xa = dx0 + 4 * step + 37, xb = dx0 + 5 * step + 37, yb = ay - 90;
+    ctx.save(); ctx.globalAlpha *= pa;
+    line(xa, yb, xb, yb, C.amber, 2.5); line(xa, yb - 10, xa, yb + 10, C.amber, 2.5); line(xb, yb - 10, xb, yb + 10, C.amber, 2.5);
+    T('TPOT', xa - 10, yb - 60, { f: font(30, 700, 'm'), c: C.amber });
+    T('time per output token', xa + 86, yb - 60, { f: font(22, 400, 'm'), c: C.soft });
+    line(xa + 50, yb - 50, (xa + xb) / 2, yb - 8, rgba(C.amber, 0.5), 1.5);
+    ctx.restore();
+  }
+  caption('Users feel both: how fast the answer starts, and how fast it streams.', lt, 5.6, 985);
+});
+
+/* 6 · KV cache */
+const KV_STEPS = 6, KV_A0 = 1.3, KV_A1 = 4.7;
+for (let s = 1; s <= KV_STEPS; s++) ev(40 + KV_A0 + (s - 1) * (KV_A1 - KV_A0) / KV_STEPS, 'blip', s);
+const KV_USERS = [5.9, 6.3, 6.7, 7.1, 7.5, 7.95];
+KV_USERS.forEach((u, i) => ev(40 + u, i === 5 ? 'alarm' : 'tick', i));
+ev(40 + 8.5, 'swish');
+[0, 1, 2, 3].forEach(i => ev(40 + 9.0 + i * 0.18, 'tick', i + 4));
+ev(40 + 9.75, 'chime');
+scene(40, 50.4, (t, lt) => {
+  label('04', 'THE KV CACHE', lt);
+  headline("Remember the past. *Don't recompute it.*", lt);
+  // part A: triangle of work
+  const aA = 1 - seg(lt, 5.0, 5.5);
+  if (aA > 0) {
+    ctx.save(); ctx.globalAlpha *= aA * eo(seg(lt, 0.6, 1.2));
+    const s = Math.min(KV_STEPS, Math.floor(seg(lt, KV_A0, KV_A1) * KV_STEPS) + 1);
+    const panels = [[300, 'Without a cache', C.red, false], [1080, 'With a KV cache', C.green, true]];
+    for (const [px, name, col, cached] of panels) {
+      T(name, px, 390, { f: font(40, 500), c: C.ink });
+      const cs = 52, cg = 8, oy = 430;
+      let work = 0;
+      for (let r = 0; r < s; r++) {
+        for (let c = 0; c <= r; c++) {
+          const current = r === s - 1;
+          const newest = c === r;
+          let fill, stroke;
+          if (current && (!cached || newest)) { fill = rgba(col, 0.45); stroke = col; work++; }
+          else if (cached) { fill = rgba(C.teal, 0.1); stroke = rgba(C.teal, 0.4); }
+          else { fill = rgba(C.faint, 0.12); stroke = rgba(C.faint, 0.35); }
+          rr(px + c * (cs + cg), oy + r * (cs + cg) - 18, cs, cs, 7, fill, stroke, 1.5);
+        }
+      }
+      const total = cached ? s : (s * (s + 1)) / 2;
+      T(cached ? `step ${s}: compute 1 new token` : `step ${s}: recompute all ${s} tokens`, px, 846, { f: font(22, 500, 'm'), c: col });
+      T(`total work so far: ${total}`, px, 882, { f: font(22, 400, 'm'), c: C.soft });
+    }
+    ctx.restore();
+  }
+  // part B: the memory budget
+  const aB = eo(seg(lt, 5.4, 5.9));
+  if (aB > 0) {
+    ctx.save(); ctx.globalAlpha *= aB;
+    const bx = 220, bw = 1480, by = 520, bh = 96, gb = 24, px = bw / gb;
+    T('GPU MEMORY · 24 GB', bx, by - 26, { f: font(22, 600, 'm'), c: C.soft, ls: 3 });
+    rr(bx, by, bw, bh, 12, rgba(C.ink, 0.03), rgba(C.ink, 0.3), 2);
+    rr(bx + 4, by + 4, 14 * px - 8, bh - 8, 9, rgba(C.blue, 0.2), rgba(C.blue, 0.7), 1.5);
+    T('model weights · 14 GB', bx + 7 * px, by + 58, { f: font(24, 500, 'm'), c: C.blue, align: 'center' });
+    const shrink = eio(seg(lt, 8.5, 9.0));
+    const per = lerp(2, 1, shrink);
+    const extra = [9.0, 9.18, 9.36, 9.54];
+    const users = KV_USERS.concat(extra);
+    let x = bx + 14 * px;
+    let over = false;
+    users.forEach((u, i) => {
+      const p = eback(seg(lt, u, u + 0.3));
+      if (p <= 0) return;
+      const w = per * px * clamp(p, 0, 1.08);
+      const beyond = x + per * px > bx + bw + 2;
+      if (beyond) over = true;
+      const col = beyond ? C.red : (i % 2 ? C.violet : C.teal);
+      rr(x + 3, by + 10, w - 6, bh - 20, 7, rgba(col, 0.3), col, 1.5);
+      if (per * px > 70) T(`user ${i + 1}`, x + w / 2, by + 56, { f: font(17, 500, 'm'), c: C.ink, align: 'center' });
+      else T(String(i + 1), x + w / 2, by + 56, { f: font(17, 500, 'm'), c: C.ink, align: 'center' });
+      x += per * px;
+    });
+    const oom = over ? 1 : 0;
+    const blink = 0.55 + 0.45 * Math.sin(lt * 18);
+    if (oom && shrink < 0.05) T('OUT OF MEMORY', bx + bw, by + bh + 64, { f: font(34, 700, 'm'), c: C.red, align: 'right', a: blink, ls: 3, glow: rgba(C.red, 0.6) });
+    T('KV cache per user (4K tokens, FP16): 2 × 32 layers × 4096 dims × 2 bytes × 4096 tokens ≈ 2 GB', bx, by + bh + 64,
+      { f: font(19, 400, 'm'), c: C.faint, a: (1 - shrink) * (1 - oom) });
+    const ok = seg(lt, 9.0, 9.4);
+    if (shrink > 0.3) {
+      T('Store the cache in FP8 → each user needs 1 GB → twice the users', bx, by + bh + 64, { f: font(22, 500, 'm'), c: C.green, a: shrink });
+      T(`${lt > 9.6 ? 10 : Math.min(10, 6 + Math.floor(seg(lt, 9.0, 9.7) * 4))} users fit`, bx + bw, by + bh + 64, { f: font(30, 700, 'm'), c: C.green, align: 'right', a: ok });
+    }
+    ctx.restore();
+    caption('The KV cache decides how many people you can serve at once.', lt, 6.2, 985);
+  }
+});
+
+/* 7 · batching */
+const REQ = [6, 3, 9, 4, 5, 8, 2, 7, 4, 6, 3, 9, 5, 2, 7, 4, 6, 3, 5, 8, 4, 6];
+const LANES = 4, TS = 30;
+function staticPlan() {
+  const bars = [], idle = []; let s = 0, k = 0;
+  while (s < TS) {
+    const b = REQ.slice(k * 4, k * 4 + 4); const m = Math.max(...b);
+    b.forEach((len, l) => { bars.push({ l, s, e: s + len, id: k * 4 + l }); if (len < m) idle.push({ l, s: s + len, e: s + m }); });
+    s += m; k++;
+  }
+  return { bars, idle };
+}
+function contPlan() {
+  const free = Array(LANES).fill(0), bars = [];
+  for (let i = 0; i < REQ.length; i++) {
+    let l = 0; for (let j = 1; j < LANES; j++) if (free[j] < free[l]) l = j;
+    if (free[l] >= TS) break;
+    bars.push({ l, s: free[l], e: free[l] + REQ[i], id: i }); free[l] += REQ[i];
+  }
+  return { bars, idle: [] };
+}
+const PLANS = [staticPlan(), contPlan()];
+// tick for each request that finishes in the continuous plan
+PLANS[1].bars.forEach(b => { if (b.e <= TS) ev(50 + 1.2 + (b.e / TS) * 6.4, 'blip', b.id % 5); });
+scene(50, 59.3, (t, lt) => {
+  label('05', 'CONTINUOUS BATCHING', lt);
+  headline('Serve many users at once. *Never let the GPU sit idle.*', lt, { size: 56 });
+  const x0 = 560, x1 = 1590, ppu = (x1 - x0) / TS;
+  const ph = TS * seg(lt, 1.2, 7.6);
+  const names = ['Static batching', 'Continuous batching'];
+  const subs = [['the batch waits for', 'its longest request'], ['a finished request is', 'replaced right away']];
+  [0, 1].forEach(k => {
+    const top = k === 0 ? 360 : 660, lh = 46, lg = 10;
+    const a = eo(seg(lt, 0.6 + k * 0.25, 1.2 + k * 0.25));
+    ctx.save(); ctx.globalAlpha *= a;
+    T(names[k], 160, top + 30, { f: font(34, 500), c: C.ink });
+    subs[k].forEach((s, j) => T(s, 160, top + 70 + j * 26, { f: font(18, 400, 'm'), c: C.faint }));
+    for (let l = 0; l < LANES; l++) {
+      const y = top + l * (lh + lg);
+      rr(x0, y, x1 - x0, lh, 8, rgba(C.ink, 0.025), rgba(C.ink, 0.08), 1);
+    }
+    const { bars, idle } = PLANS[k];
+    let busy = 0, fin = 0;
+    for (const z of idle) {
+      if (z.s >= ph) continue;
+      const e = Math.min(z.e, ph, TS); const y = top + z.l * (lh + lg);
+      ctx.save(); ctx.beginPath(); ctx.rect(x0 + z.s * ppu, y, (e - z.s) * ppu, lh); ctx.clip();
+      ctx.fillStyle = rgba(C.red, 0.07); ctx.fillRect(x0 + z.s * ppu, y, (e - z.s) * ppu, lh);
+      ctx.strokeStyle = rgba(C.red, 0.35); ctx.lineWidth = 1.5; ctx.beginPath();
+      for (let hx = x0 + z.s * ppu - lh; hx < x0 + e * ppu; hx += 12) { ctx.moveTo(hx, y + lh); ctx.lineTo(hx + lh, y); }
+      ctx.stroke(); ctx.restore();
+    }
+    for (const b of bars) {
+      if (b.s >= ph) continue;
+      const e = Math.min(b.e, ph, TS); busy += e - b.s; if (b.e <= ph) fin++;
+      const y = top + b.l * (lh + lg), col = PAL[b.id % 5];
+      rr(x0 + b.s * ppu + 2, y + 3, Math.max(0, (e - b.s) * ppu - 4), lh - 6, 7, rgba(col, 0.28), rgba(col, 0.9), 1.5);
+      if ((e - b.s) * ppu > 50) T(`R${b.id + 1}`, x0 + b.s * ppu + 14, y + 30, { f: font(17, 600, 'm'), c: C.ink });
+    }
+    const util = ph > 0 ? Math.round((100 * busy) / (LANES * Math.min(ph, TS))) : 0;
+    T(`${util}%`, 1760, top + 70, { f: font(60, 560), c: k ? C.green : C.red, align: 'right' });
+    T('GPU busy', 1760, top + 104, { f: font(18, 500, 'm'), c: C.faint, align: 'right' });
+    T(`${fin} done`, 1760, top + 158, { f: font(26, 600, 'm'), c: C.ink, align: 'right' });
+    ctx.restore();
+  });
+  // playhead
+  const px = x0 + ph * ppu;
+  if (lt > 1.2) line(px, 340, px, 900, rgba(C.amber, 0.8 * (1 - seg(lt, 7.6, 8.2))), 2);
+  caption('Same GPU, same time: more answers. This is how vLLM and SGLang schedule work.', lt, 6.0, 985);
+});
+
+/* 8 · roofline */
+ev(59 + 2.7, 'blip', 0); ev(59 + 3.5, 'blip', 3); ev(59 + 4.7, 'swish');
+scene(59, 66.3, (t, lt) => {
+  label('06', 'THE ROOFLINE', lt);
+  headline('Know *which wall* you are hitting.', lt);
+  const X0 = 440, Y0 = 870, RX = 1000, RY = 420, X1 = 1520;
+  const yOn = x => x < RX ? Y0 - (x - X0) * ((Y0 - RY) / (RX - X0)) : RY;
+  const A = eo(seg(lt, 0.5, 1.0));
+  ctx.save(); ctx.globalAlpha *= A;
+  line(X0, Y0, X1 + 40, Y0, rgba(C.ink, 0.4), 2); line(X0, Y0, X0, 360, rgba(C.ink, 0.4), 2);
+  T('arithmetic intensity  (FLOPs per byte moved)  →', X0, Y0 + 50, { f: font(20, 500, 'm'), c: C.faint });
+  ctx.save(); ctx.translate(X0 - 30, Y0); ctx.rotate(-Math.PI / 2);
+  T('speed  (FLOP/s)  →', 0, 0, { f: font(20, 500, 'm'), c: C.faint }); ctx.restore();
+  ctx.restore();
+  // roof draw
+  const d = eio(seg(lt, 0.9, 2.2));
+  const L1 = Math.hypot(RX - X0, Y0 - RY), L2 = X1 - RX, Lt = L1 + L2, cur = d * Lt;
+  ctx.save(); ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.shadowColor = rgba(C.amber, 0.6); ctx.shadowBlur = 18; ctx.strokeStyle = C.amber;
+  ctx.beginPath(); ctx.moveTo(X0, Y0);
+  if (cur <= L1) { const q = cur / L1; ctx.lineTo(lerp(X0, RX, q), lerp(Y0, RY, q)); }
+  else { ctx.lineTo(RX, RY); ctx.lineTo(RX + (cur - L1), RY); }
+  ctx.stroke(); ctx.restore();
+  const la = seg(lt, 1.8, 2.4);
+  ctx.save(); ctx.translate(640, 690); ctx.rotate(-Math.atan2(Y0 - RY, RX - X0));
+  T('limited by memory bandwidth', 0, -16, { f: font(21, 500, 'm'), c: C.amber, a: la }); ctx.restore();
+  T('limited by compute', 1260, RY - 22, { f: font(21, 500, 'm'), c: C.amber, a: la, align: 'center' });
+  // dots
+  const dot = (x, y, col, a, title, sub, side = 1) => {
+    if (a <= 0) return;
+    ctx.save(); ctx.globalAlpha *= a;
+    ctx.shadowColor = col; ctx.shadowBlur = 30; ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, 13, 0, 7); ctx.fill(); ctx.shadowBlur = 0;
+    T(title, x + 28 * side, y + 52, { f: font(26, 600, 'm'), c: col, align: side > 0 ? 'left' : 'right' });
+    T(sub, x + 28 * side, y + 84, { f: font(19, 400, 'm'), c: C.soft, align: side > 0 ? 'left' : 'right' });
+    ctx.restore();
+  };
+  const up = eio(seg(lt, 4.7, 5.9));
+  const dX = lerp(510, 860, up);
+  const dA = eo(seg(lt, 2.6, 3.1));
+  dot(dX, yOn(dX) - (1 - dA) * 40, C.red, dA, up > 0.5 ? 'decode · batch 64' : 'decode · batch 1', up > 0.5 ? 'batching climbs the slope' : 'memory-bound');
+  const pA = eo(seg(lt, 3.4, 3.9));
+  dot(1330, RY - (1 - pA) * 40, C.blue, pA, 'prefill · 2048 tokens', 'compute-bound', -1);
+  caption('Batching raises arithmetic intensity: more useful math for every byte moved.', lt, 5.0, 985);
+});
+
+/* 9 · roadmap */
+[0, 1, 2, 3].forEach(i => ev(66 + 1.0 + i * 0.35, 'blip', i + 1));
+scene(66, 73.3, (t, lt) => {
+  headline('From your first token to *serving at scale.*', lt, { align: 'center', y: 220, size: 64 });
+  const L = [
+    ['LEVEL 1', 'Beginner', C.green, ['Tokens & the forward pass', 'GPU first principles', 'Roofline, prefill & decode']],
+    ['LEVEL 2', 'Intermediate', C.blue, ['CUDA fundamentals', 'Parallel patterns & GEMM', 'Profiling & kernels']],
+    ['LEVEL 3', 'Advanced', C.violet, ['KV cache & PagedAttention', 'Engines & batching', 'Quantization & speculation']],
+    ['LEVEL 4', 'Expert', C.amber, ['Multi-GPU parallelism', 'Disaggregation & routing', 'Cost per token']],
+  ];
+  const cw = 370, gap = 30, x0 = (W - (cw * 4 + gap * 3)) / 2, y0 = 330, ch = 360;
+  const ld = eio(seg(lt, 0.8, 2.4));
+  line(x0 + cw / 2, y0, x0 + cw / 2 + (cw + gap) * 3 * ld, y0, rgba(C.ink, 0.25), 2, [6, 8]);
+  L.forEach(([lv, name, col, items], i) => {
+    const a = eo(seg(lt, 1.0 + i * 0.35, 1.6 + i * 0.35));
+    if (a <= 0) return;
+    const x = x0 + i * (cw + gap), y = y0 + 30 + (1 - a) * 40;
+    ctx.save(); ctx.globalAlpha *= a;
+    rr(x, y, cw, ch, 18, rgba(C.paper2, 0.92), rgba(col, 0.55), 2);
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x + cw / 2, y0, 9, 0, 7); ctx.fill();
+    T(lv, x + 32, y + 56, { f: font(20, 600, 'm'), c: col, ls: 4 });
+    T(name, x + 32, y + 114, { f: font(46, 520), c: C.ink });
+    items.forEach((it, j) => {
+      const ia = seg(lt, 1.5 + i * 0.35 + j * 0.12, 2.0 + i * 0.35 + j * 0.12);
+      ctx.fillStyle = rgba(col, ia); ctx.fillRect(x + 34, y + 175 + j * 56, 8, 8);
+      T(it, x + 56, y + 185 + j * 56, { f: font(21, 400, 's'), c: C.soft, a: ia });
+    });
+    ctx.restore();
+  });
+  const n = seg(lt, 2.6, 4.0);
+  const nums = [[4, 'levels'], [18, 'modules'], [109, 'chapters']];
+  const sf = font(30, 500, 'm');
+  const str = nums.map(([v, w]) => `${Math.round(v * eo(n))} ${w}`).join('   ·   ');
+  T(str, W / 2, 800, { f: sf, c: C.ink, align: 'center', a: seg(lt, 2.6, 3.0) });
+  const arc = ['Concept', 'Animation', 'Code lab', 'Sources', 'Quiz'];
+  const af = font(28, 400, 's', true);
+  const full = arc.join('  →  ');
+  let ax = (W - measure(full, af)) / 2;
+  arc.forEach((w, i) => {
+    const a = eo(seg(lt, 3.8 + i * 0.25, 4.2 + i * 0.25));
+    T(w, ax, 880, { f: af, c: C.amber, a });
+    ax += measure(w, af);
+    if (i < arc.length - 1) { T('  →  ', ax, 880, { f: af, c: C.faint, a }); ax += measure('  →  ', af); }
+  });
+  T('every chapter', W / 2, 930, { f: font(18, 500, 'm'), c: C.faint, align: 'center', ls: 4, a: seg(lt, 4.6, 5.2) });
+});
+
+/* 10 · call to action */
+ev(73.4, 'boom'); ev(75.6, 'chime');
+scene(73, 80, (t, lt) => {
+  const r = mulberry(21);
+  for (let i = 0; i < 60; i++) {
+    const x = r() * W, y = (r() * H - lt * (10 + r() * 16)) % H, s = 1 + r() * 2;
+    ctx.fillStyle = rgba(C.amber, 0.1 + 0.2 * r()); ctx.fillRect(x, (y + H) % H, s, s);
+  }
+  const la = eo(seg(lt, 0.2, 0.9));
+  if (logo.complete) { ctx.save(); ctx.globalAlpha *= la; ctx.drawImage(logo, W / 2 - 46, 200, 92, 92); ctx.restore(); }
+  const tf1 = font(96, 560), tf2 = font(96, 480, 'd', true);
+  const w1 = measure('Inference Engineering, ', tf1), w2 = measure('from Scratch', tf2);
+  const tx = (W - w1 - w2) / 2, ta = eo(seg(lt, 0.4, 1.3));
+  T('Inference Engineering, ', tx, 420 + (1 - ta) * 20, { f: tf1, a: ta });
+  T('from Scratch', tx + w1, 420 + (1 - ta) * 20, { f: tf2, c: C.amber, a: ta, glow: rgba(C.amber, 0.35), blur: 36 });
+  T('Free and open source. All of Level 1 runs on any laptop, no GPU needed.', W / 2, 510,
+    { f: font(36, 400, 's'), c: C.soft, align: 'center', a: eo(seg(lt, 1.2, 1.9)) });
+  const ga = eo(seg(lt, 2.0, 2.7));
+  const url = 'github.com/ItWasYou-SAM/AI-INFERENCE-ENGINEERING-FROM-SCRATCH';
+  const uf = font(30, 500, 'm'), uw = measure(url, uf) + 120;
+  ctx.save(); ctx.globalAlpha *= ga;
+  rr((W - uw) / 2, 600 + (1 - ga) * 16, uw, 84, 42, rgba(C.amber, 0.1), rgba(C.amber, 0.7), 2);
+  T('★', (W - uw) / 2 + 40, 654 + (1 - ga) * 16, { f: font(32, 500, 'm'), c: C.amber });
+  T(url, (W - uw) / 2 + 84, 653 + (1 - ga) * 16, { f: uf, c: C.ink });
+  ctx.restore();
+  T('Star it, clone it, and start with Chapter 0.1 →', W / 2, 790, { f: font(34, 460, 'd', true), c: C.ink, align: 'center', a: eo(seg(lt, 2.6, 3.3)) });
+  T('npm install  &&  npm run dev', W / 2, 850, { f: font(22, 400, 'm'), c: C.faint, align: 'center', a: eo(seg(lt, 3.0, 3.6)) });
+});
+
+/* transitions between scenes */
+S.slice(1).forEach(sc => { if (sc.s > 9 && sc.s < 73) ev(sc.s - 0.35, 'whoosh'); });
+
+/* ───────────────────────── frame ───────────────────────── */
+function draw(t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  background(t);
+  for (const sc of S) {
+    if (t < sc.s || t > sc.e) continue;
+    const lt = t - sc.s, d = sc.e - sc.s;
+    const fade = Math.min(eo(seg(lt, 0, 0.55)), 1 - eio(seg(t, sc.e - 0.55, sc.e)));
+    ctx.save();
+    ctx.globalAlpha = fade;
+    const z = 1 + 0.028 * (lt / d);
+    ctx.translate(W / 2, H / 2); ctx.scale(z, z); ctx.translate(-W / 2, -H / 2);
+    sc.draw(t, lt);
+    ctx.restore();
+  }
+  finish(t);
+}
+
+window.DURATION = D;
+window.EVENTS = EVENTS.sort((a, b) => a.t - b.t);
+window.draw = draw;
+window.ready = Promise.all([
+  document.fonts.load(font(40, 500)), document.fonts.load(font(40, 500, 'd', true)),
+  document.fonts.load(font(40, 500, 'm')), document.fonts.load(font(40, 400, 's')),
+  new Promise(r => { if (logo.complete) r(); else { logo.onload = r; logo.onerror = r; } }),
+]);
+
+const params = new URLSearchParams(location.search);
+if (params.has('render')) {
+  document.body.classList.add('render');
+} else {
+  // live preview: plays in real time, click to restart, ?t=12 to jump
+  let t0 = performance.now() - (parseFloat(params.get('t')) || 0) * 1000;
+  cv.addEventListener('click', () => { t0 = performance.now(); });
+  window.ready.then(() => {
+    const loop = now => { draw(((now - t0) / 1000) % D); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  });
+}
+</script>
+</body>
+</html>

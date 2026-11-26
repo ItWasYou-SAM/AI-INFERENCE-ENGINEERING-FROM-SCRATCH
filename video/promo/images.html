@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Inference Engineering, from Scratch: promo images</title>
+<style>
+  @font-face { font-family: 'Fraunces'; src: url(../trailer/fonts/fraunces-latin-wght-normal.woff2) format('woff2'); font-weight: 100 900; font-style: normal; }
+  @font-face { font-family: 'Fraunces'; src: url(../trailer/fonts/fraunces-latin-wght-italic.woff2) format('woff2'); font-weight: 100 900; font-style: italic; }
+  @font-face { font-family: 'JBM'; src: url(../trailer/fonts/jetbrains-mono-latin-wght-normal.woff2) format('woff2'); font-weight: 100 800; }
+  @font-face { font-family: 'Serif4'; src: url(../trailer/fonts/source-serif-4-latin-wght-normal.woff2) format('woff2'); font-weight: 200 900; }
+  body { margin: 0; background: #07090d; color: #ebe5d6; font: 14px JBM, monospace; padding: 24px; }
+  nav { margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
+  nav button { background: #19202b; color: inherit; border: 1px solid #2d3644; border-radius: 6px; padding: 6px 10px; font: inherit; cursor: pointer; }
+  canvas { max-width: 100%; max-height: 85vh; display: block; }
+</style>
+</head>
+<body>
+<nav id="nav"></nav>
+<canvas id="cv" width="1200" height="630"></canvas>
+<script src="lib.js"></script>
+<script>
+const cv = document.getElementById('cv');
+
+// A tilted, shadowed card holding a screenshot (figure or page)
+function tiltCard(img, cx, cy, w, angle, o = {}) {
+  if (!img?.naturalWidth) return;
+  const sh = o.sh ?? img.naturalHeight, sy = o.sy ?? 0;
+  const h = (w * sh) / img.naturalWidth;
+  ctx.save();
+  ctx.translate(cx, cy); ctx.rotate((angle * Math.PI) / 180);
+  ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = w * 0.08; ctx.shadowOffsetY = w * 0.03;
+  rr(-w / 2, -h / 2, w, h, w * 0.02, C.site);
+  ctx.shadowColor = 'transparent';
+  ctx.beginPath(); ctx.roundRect(-w / 2, -h / 2, w, h, w * 0.02); ctx.clip();
+  ctx.drawImage(img, 0, sy, img.naturalWidth, sh, -w / 2, -h / 2, w, h);
+  ctx.restore();
+}
+function urlPill(cx, y, size) {
+  const uf = font(size, 500, 'm'), uw = measure(URL_GH, uf) + size * 3.6, h = size * 2.6;
+  rr(cx - uw / 2, y, uw, h, h / 2, rgba(C.amber, 0.1), rgba(C.amber, 0.7), 2);
+  T('★', cx - uw / 2 + size * 1.3, y + h / 2 + size * 0.36, { f: font(size, 500, 'm'), c: C.amber });
+  T(URL_GH, cx - uw / 2 + size * 2.6, y + h / 2 + size * 0.36, { f: uf });
+}
+function stats(x, y, size, gap, align = 'left') {
+  const items = [['4', 'levels'], ['18', 'modules'], ['109', 'chapters'], ['free', 'open source']];
+  const total = gap * (items.length - 1);
+  items.forEach(([n, l], i) => {
+    const xx = align === 'center' ? x - total / 2 + i * gap : x + i * gap;
+    T(n, xx, y, { f: font(size, 540), c: i === 3 ? C.amber : C.ink, align });
+    T(l.toUpperCase(), xx, y + size * 0.62, { f: font(size * 0.3, 500, 'm'), c: C.faint, align, ls: 2 });
+  });
+}
+
+const POSTERS = {
+  // Open Graph / link preview (GitHub social preview, LinkedIn, X, Slack)
+  'og-card-1200x630': [1200, 630, () => {
+    background(3, 1);
+    tiltCard(IMG['fig-kv-4'], 960, 360, 430, 6);
+    tiltCard(IMG['fig-reduce-2'], 820, 250, 380, -5);
+    T('AN OPEN FIELD GUIDE · BEGINNER TO EXPERT', 70, 120, { f: font(16, 600, 'm'), c: C.amber, ls: 2 });
+    T('Inference', 70, 205, { f: font(76, 560) });
+    T('Engineering,', 70, 285, { f: font(76, 560) });
+    T('from Scratch', 70, 365, { f: font(76, 480, 'd', true), c: C.amber, glow: rgba(C.amber, 0.35), blur: 30 });
+    wrap('How LLMs are served, from GPU memory to KV caches, batching and routing.', 72, 430, 520, 34, { f: font(25, 400, 's'), c: C.soft });
+    stats(72, 560, 42, 125);
+  }],
+  // YouTube / video thumbnail
+  'thumbnail-1280x720': [1280, 720, () => {
+    background(8, 1);
+    tiltCard(IMG['fig-kv-4'], 1015, 360, 450, 4);
+    T('What happens after', 70, 190, { f: font(70, 560) });
+    T('you press', 70, 275, { f: font(70, 560) });
+    T('Enter?', 70 + measure('you press ', font(70, 560)), 275, { f: font(70, 480, 'd', true), c: C.amber, glow: rgba(C.amber, 0.4), blur: 30 });
+    rr(70, 340, 470, 64, 32, rgba(C.red, 0.14), rgba(C.red, 0.8), 2);
+    T('the GPU runs out of memory', 305, 382, { f: font(24, 500, 'm'), c: C.red, align: 'center' });
+    T('A free course on LLM inference,', 70, 520, { f: font(32, 400, 's'), c: C.soft });
+    T('from GPU memory to serving at scale.', 70, 564, { f: font(32, 400, 's'), c: C.soft });
+    titleLockup(370, 660, 34);
+  }],
+  // Instagram / LinkedIn square post
+  'post-square-1080x1080': [1080, 1080, () => {
+    background(14, 1);
+    T('YOU TALK TO AN AI EVERY DAY.', 540, 130, { f: font(24, 600, 'm'), c: C.amber, align: 'center', ls: 3 });
+    T('Learn what happens', 540, 215, { f: font(66, 540), align: 'center' });
+    T('after you press Enter.', 540, 295, { f: font(66, 480, 'd', true), c: C.amber, align: 'center', glow: rgba(C.amber, 0.3), blur: 28 });
+    tiltCard(IMG['fig-request-3'], 330, 600, 470, -4);
+    tiltCard(IMG['fig-roofline-2'], 760, 620, 420, 5);
+    titleLockup(540, 930, 42);
+    T('Interactive figures · real CUDA labs · quizzes · free & open source', 540, 1000, { f: font(24, 400, 's'), c: C.soft, align: 'center' });
+  }],
+  // Instagram / WhatsApp story, or a printable poster
+  'story-1080x1920': [1080, 1920, () => {
+    background(21, 1);
+    T('AN OPEN FIELD GUIDE · BEGINNER TO EXPERT', 540, 150, { f: font(24, 600, 'm'), c: C.amber, align: 'center', ls: 2 });
+    T('Inference', 540, 270, { f: font(110, 560), align: 'center' });
+    T('Engineering,', 540, 385, { f: font(110, 560), align: 'center' });
+    T('from Scratch', 540, 500, { f: font(110, 480, 'd', true), c: C.amber, align: 'center', glow: rgba(C.amber, 0.35), blur: 40 });
+    T('How LLMs are served, from GPU memory', 540, 580, { f: font(36, 400, 's'), c: C.soft, align: 'center' });
+    T('to KV caches, batching and routing.', 540, 628, { f: font(36, 400, 's'), c: C.soft, align: 'center' });
+    tiltCard(IMG['home-hero'], 540, 920, 820, -2, { sh: 1800 });
+    tiltCard(IMG['fig-kv-4'], 290, 1190, 380, -5);
+    tiltCard(IMG['fig-scan-9'], 800, 1180, 380, 5);
+    const list = USE_CASES.map((u) => u[1]);
+    T('Made for students who want to…', 540, 1432, { f: font(44, 520), align: 'center' });
+    list.forEach((s, i) => {
+      const col = i % 2, row = Math.floor(i / 2);
+      const x = 90 + col * 470, y = 1470 + row * 96;
+      rr(x, y, 430, 78, 16, 'rgba(255,255,255,0.04)', rgba([C.teal, C.blue, C.violet, C.green, C.amber, C.red][i], 0.6), 2);
+      wrap(s, x + 24, y + 33, 390, 30, { f: font(25, 500, 's') });
+    });
+    T('★ Star it on GitHub', 540, 1820, { f: font(40, 500, 'd', true), c: C.amber, align: 'center' });
+    T(URL_GH, 540, 1866, { f: font(20, 500, 'm'), c: C.soft, align: 'center' });
+  }],
+  // X / LinkedIn profile banner
+  'banner-1500x500': [1500, 500, () => {
+    background(30, 1);
+    tiltCard(IMG['fig-roofline-2'], 1110, 255, 280, -5);
+    tiltCard(IMG['fig-kv-4'], 1300, 250, 290, 6);
+    T('Inference Engineering,', 80, 200, { f: font(70, 560) });
+    T('from Scratch', 80, 285, { f: font(70, 480, 'd', true), c: C.amber, glow: rgba(C.amber, 0.35), blur: 30 });
+    T('A free, open course on how LLMs are served, from GPU memory to scale.', 82, 350, { f: font(24, 400, 's'), c: C.soft });
+    T(URL_GH, 82, 410, { f: font(18, 500, 'm'), c: C.faint });
+  }],
+  // Instagram portrait carousel slide: the use cases
+  'use-cases-1080x1350': [1080, 1350, () => {
+    background(40, 1);
+    T('INFERENCE ENGINEERING, FROM SCRATCH', 540, 120, { f: font(22, 600, 'm'), c: C.amber, align: 'center', ls: 3 });
+    T('Made for students', 540, 215, { f: font(70, 540), align: 'center' });
+    T('who want to…', 540, 295, { f: font(70, 480, 'd', true), c: C.amber, align: 'center' });
+    USE_CASES.forEach(([n, head, sub], i) => {
+      const y = 360 + i * 140;
+      const col = [C.teal, C.blue, C.violet, C.green, C.amber, C.red][i];
+      rr(80, y, 920, 122, 18, 'rgba(255,255,255,0.035)', rgba(col, 0.55), 2);
+      T(n, 120, y + 70, { f: font(26, 600, 'm'), c: col });
+      T(head, 200, y + 54, { f: font(36, 520) });
+      T(sub, 200, y + 96, { f: font(25, 400, 's'), c: C.soft });
+    });
+    urlPill(540, 1225, 18);
+  }],
+};
+
+function renderPoster(name) {
+  const [w, h, fn] = POSTERS[name];
+  cv.width = w; cv.height = h;
+  useCanvas(cv);
+  fn();
+  finishFrame(0, 0.5);
+  return cv.toDataURL('image/png').split(',')[1];
+}
+window.POSTERS = POSTERS;
+window.renderPoster = renderPoster;
+window.ready = Promise.all([fontsReady, imagesReady]);
+
+// browsing: a button per poster
+const nav = document.getElementById('nav');
+for (const n of Object.keys(POSTERS)) {
+  const b = document.createElement('button'); b.textContent = n; b.onclick = () => renderPoster(n); nav.appendChild(b);
+}
+window.ready.then(() => renderPoster(Object.keys(POSTERS)[0]));
+</script>
+</body>
+</html>
