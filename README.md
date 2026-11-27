@@ -81,8 +81,8 @@ python labs/m00/0.3/check_env.py       # tells you which labs (🟢 🟡 🔴) w
 
 This is an early, growing course:
 
-- ✅ **Written:** Module 0 (0.1–0.3) · Module 1, the LLM forward pass (1.1–1.6) · Module 2, GPU hardware first principles (2.1–2.7) · Module 3, the performance mental model (3.1–3.5) · Module 4, CUDA fundamentals (4.1–4.8) · Module 5, parallel patterns (5.1–5.7) · Module 6, GEMM and memory optimization (6.1–6.8) · 9.1 How big is the KV cache?
-- 📝 **Outlined:** the other 64 chapters, each with its sources already mapped.
+- ✅ **Written:** Module 0 (0.1–0.3) · Module 1, the LLM forward pass (1.1–1.6) · Module 2, GPU hardware first principles (2.1–2.7) · Module 3, the performance mental model (3.1–3.5) · Module 4, CUDA fundamentals (4.1–4.8) · Module 5, parallel patterns (5.1–5.7) · Module 6, GEMM and memory optimization (6.1–6.8) · Module 7, profiling (7.1–7.5) · 9.1 How big is the KV cache?
+- 📝 **Outlined:** the other 59 chapters, each with its sources already mapped.
 
 ## ✎ Built on
 

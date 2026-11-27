@@ -1,0 +1,366 @@
+---
+summary: "NVIDIA ships two profilers for two different questions. Nsight Systems records a timeline of the whole program, CPU and GPU, and tells you where the time goes. Nsight Compute replays one kernel many times while reading hundreds of hardware counters, and tells you why that kernel is slow. This chapter points both at one small program, reads their output line by line, and catches one of them reporting a wrong number."
+duration: 25 min
+objectives:
+  - Say which question each tool answers, what it costs to run, and when to reach for it
+  - Profile a program with nsys, read its summary tables, and find the GPU's idle time and the dominant kernel
+  - Add NVTX ranges so the timeline shows your program's phases by name
+  - Profile one kernel with ncu and read Speed of Light, sectors per request, occupancy, warp stalls and the per-instruction source view
+  - Check a counter against what the kernel must do before believing it
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+The top-down method from [7.1](/learn/m07/top-down-profiling) needs a tool for each level. NVIDIA's two profilers split the work between them:
+
+| | **Nsight Systems** (`nsys`) | **Nsight Compute** (`ncu`) |
+|:--|:--|:--|
+| Question | Where does the time go? | Why is this kernel slow? |
+| Scope | the whole program: CPU threads, CUDA API calls, copies, kernels, NVTX ranges | one kernel launch at a time |
+| How | records start and end times of events as they happen | replays each kernel several times, reading a different set of counters each pass |
+| Overhead | small: the program runs at close to normal speed | large: kernels are serialized and replayed, often 10–100× slower overall |
+| Output | a timeline, plus summary tables | throughput as % of peak, memory traffic, occupancy, stall reasons, per-line counters |
+| Levels in 7.1 | 1 (timeline) and 2 (kernels) | 3 (inside one kernel) |
+
+Use them in that order. Nsight Systems shows which kernel matters. Nsight Compute then explains that kernel, and only that one.
+
+## The lab program
+
+`labs/m07/7.2/tools.cu` runs ten steps. Each step does what a small inference loop often does:
+
+1. copy a 64 MB input from pinned host memory (`cudaMemcpyAsync`)
+2. `scale_coalesced`: `y[i] = 2 * x[i]`, neighbouring threads reading neighbouring floats
+3. `scale_strided`: the same work, but neighbouring threads touch floats 32 apart ([4.7](/learn/m04/coalesced-vs-strided))
+4. `sum_kernel`: add up `y` into one float
+5. read the sum back with `cudaMemcpy`, which waits for everything before it
+6. "post-process" on the CPU for 2 ms
+
+```text title="output (RTX 3050 6GB Laptop)"
+step (wall clock, mean of 10): 26.21 ms
+scale_coalesced: 0.854 ms   157.2 GB/s
+scale_strided:   17.512 ms     7.7 GB/s
+peak DRAM bandwidth (from clocks): 168.0 GB/s
+sum = 100663288 (expected 100663290) PASS
+```
+
+So we already know a step takes 26 ms, but not where those 26 ms go.
+
+## Nsight Systems: where the time goes
+
+Record a timeline, then print its summary tables:
+
+```bash
+nsys profile -t cuda,nvtx -o tools ./tools
+nsys stats -r nvtx_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum tools.nsys-rep
+```
+
+`-t cuda,nvtx` traces CUDA API calls, GPU activity and NVTX ranges. Open `tools.nsys-rep` in the GUI (`nsys-ui`) to see the timeline
+itself. `nsys stats` prints the same data as tables. Here they are, trimmed to the useful columns:
+
+```text title="nsys stats: GPU kernels"
+ Time (%)  Total Time (ns)  Instances    Avg (ns)    Name
+     94.6      612,813,044         35  17,508,944    scale_strided(const float *, float *, int)
+      4.6       29,808,990         35     851,685    scale_coalesced(const float *, float *, int)
+      0.8        5,308,710         12     442,392    sum_kernel(const float *, float *, int)
+```
+
+```text title="nsys stats: GPU copies"
+ Time (%)  Total Time (ns)  Count   Avg (ns)    Operation
+    100.0       62,448,152     12  5,204,012    [CUDA memcpy Host-to-Device]
+      0.0           13,408     12      1,117    [CUDA memcpy Device-to-Host]
+```
+
+That's level 2 of the method: `scale_strided` takes **95%** of all kernel time, 20× as long as the coalesced version of the same work.
+The input copy moves 64 MB in 5.2 ms, about 12.9 GB/s over PCIe ([4.3](/learn/m04/host-device-memory)).
+
+### NVTX: naming your own phases
+
+Nsight Systems knows about kernels and API calls, but not that "post-processing" is a phase of your program. **NVTX** ranges add that.
+The labs wrap them in a small helper in `labs/m07/common.cuh`:
+
+```cpp
+#include <nvtx3/nvToolsExt.h>           // header-only, ships with the CUDA toolkit
+struct Range {                          // { Range r("step"); ... } marks the enclosing scope
+    explicit Range(const char* name) { nvtxRangePushA(name); }
+    ~Range() { nvtxRangePop(); }
+};
+```
+
+In PyTorch the equivalent is `torch.cuda.nvtx.range_push`/`range_pop`, or `with torch.autograd.profiler.emit_nvtx():` to name every
+operator ([7.4](/learn/m07/pytorch-profiler)). The ranges show up as their own row on the timeline and in their own table:
+
+```text title="nsys stats: NVTX ranges"
+ Time (%)  Total Time (ns)  Instances     Avg (ns)   Range
+     50.4      312,371,528         12   26,030,960   :step
+     45.7      282,939,996         12   23,578,333   :read sum back
+      3.9       24,004,463         12    2,000,371   :CPU post-process
+```
+
+### One step, laid out in time
+
+Summary tables add things up. A timeline shows what overlaps with what. `step_timeline.py` prints one step of the timeline as text, from
+the SQLite export of the report:
+
+```bash
+nsys export -t sqlite -o tools.sqlite tools.nsys-rep && python3 step_timeline.py tools.sqlite
+```
+
+```text title="output: step 6"
+step #6: 26.04 ms
+     0.00 -   5.21 ms  GPU copy    host to device
+     0.01 -  24.03 ms  CPU range   read sum back
+     5.22 -   6.07 ms  GPU kernel  scale_coalesced
+     6.07 -  23.58 ms  GPU kernel  scale_strided
+    23.58 -  24.02 ms  GPU kernel  sum_kernel
+    24.03 -  24.03 ms  GPU copy    device to host
+    24.03 -  26.03 ms  CPU range   CPU post-process
+```
+
+Read it the way you would read the GUI:
+
+- **The CPU is ahead until it isn't.** All four launches are queued within 10 µs, then the CPU enters "read sum back" at 0.01 ms and
+  stays there for **24 ms**. That range doesn't measure a copy, which takes 1 µs at 24.03 ms. It measures the CPU *waiting* for the stream
+  to reach the copy. The API table says the same thing: `cudaMemcpy` averages 23.6 ms per call. A CPU-side range includes any wait inside
+  it ([7.3](/learn/m07/what-kernel-time-measures)).
+- **The GPU idles during post-processing.** From 24.03 to 26.03 ms nothing runs on the GPU: 2 ms of 26, or 7.7% of every step. In the
+  GUI that's a visible gap in the GPU row. The fix would be to overlap it: start the next step's copy and kernels before post-processing
+  this one.
+- **Nothing overlaps on the GPU.** The copy, the kernels and the readback run one after another in one stream. Splitting the input into
+  chunks on several streams would overlap the 5.2 ms copy with compute ([4.6](/learn/m04/launch-async-streams)).
+
+The biggest item by far, though, is `scale_strided`. Nsight Systems can't say why it's slow. That's the other tool's job.
+
+## Nsight Compute: why one kernel is slow
+
+Profile the two `scale` kernels, one launch each, and save a report:
+
+```bash
+ncu -k regex:scale -c 2 --section SpeedOfLight --section Occupancy --section WarpStateStats \
+    --section SourceCounters --import-source yes -o scale ./tools
+ncu -i scale.ncu-repz                   # print it; or open it in ncu-ui
+```
+
+`-k` picks kernels by name, `-c` limits the number of launches profiled, and `--launch-skip` (not used here) skips the first few, for
+example warm-up calls. Each `--section` adds one group of counters. `--set full` collects all of them, at the cost of more replay passes.
+Build with `-lineinfo` so the report can map instructions back to source lines.
+
+### Speed of Light
+
+The first section compares the kernel's throughput with the hardware's peaks, as in [3.1](/learn/m03/compute-vs-memory-bound):
+
+```text title="ncu: GPU Speed Of Light Throughput"
+                            scale_coalesced   scale_strided
+    Duration                      852.74 us        17.90 ms
+    Memory Throughput                 46.87 %         28.79 %
+    DRAM Throughput                   46.87 %         26.86 %
+    Compute (SM) Throughput           12.47 %          1.13 %
+```
+
+Both kernels do almost no math, so both should be limited by memory. But neither is close to 100%, and the coalesced one, according to
+this, only reaches 47% of DRAM bandwidth. Hold that thought: one of those numbers is wrong, and we'll come back to it.
+
+### Sectors per request: the coalescing check
+
+A warp's load instruction becomes one **request** to the L1, which fetches 32-byte **sectors**. 32 lanes reading 32 consecutive floats
+need 128 bytes, which is 4 sectors. 32 lanes reading floats 32 apart need 32 different sectors, one per lane, and use 4 bytes of each:
+
+```text title="ncu: global loads and stores"
+                                                scale_coalesced   scale_strided
+    l1tex__t_requests_pipe_lsu_mem_global_op_ld         524,288         524,288
+    l1tex__t_sectors_pipe_lsu_mem_global_op_ld        2,097,152      16,777,216
+    l1tex__t_requests_pipe_lsu_mem_global_op_st         524,288         524,288
+    l1tex__t_sectors_pipe_lsu_mem_global_op_st        2,097,152      16,777,216
+```
+
+The same number of requests. **4 sectors per request** for the coalesced kernel, **32** for the strided one: 8× the memory traffic for
+the same useful data. The report's own rule says so in words:
+
+```text
+This workload has uncoalesced global accesses resulting in a total of 29360128 excessive sectors (88% of the
+total 33554432 sectors).
+```
+
+### Occupancy and warp stalls
+
+```text title="ncu: Occupancy and Warp State Statistics"
+                                         scale_coalesced   scale_strided
+    Registers Per Thread                              16              16
+    Theoretical Occupancy                          100 %           100 %
+    Achieved Occupancy                           80.28 %         76.48 %
+    Warp Cycles Per Issued Instruction            132.59          808.15
+      Stall Long Scoreboard                       125.91          348.31
+      Stall Drain                                   1.55          230.71
+      Stall Short Scoreboard                        1.67          144.78
+      Stall MIO Throttle                            0.00           65.79
+```
+
+**Occupancy is not the problem.** Both kernels fill the SMs with warps ([2.5](/learn/m02/occupancy-latency-hiding)). The same sections
+report register use and, in Memory Workload Analysis, any local-memory **spills** ([6.3](/learn/m06/register-pressure-spilling)). Here
+both are clean.
+
+**Warp stalls** say what each warp waits on between two instructions. A warp of the strided kernel waits **808 cycles** per instruction,
+6× longer than the coalesced one:
+
+- **Long scoreboard**: waiting for a load from global memory. The main reason in both kernels, but 2.8× longer in the strided one,
+  because each load now waits for 32 sectors instead of 4.
+- **Drain**: waiting at exit for outstanding stores to finish. 231 cycles here, because every warp's store also touches 32 sectors.
+- **MIO throttle** and **short scoreboard**: the memory pipeline is backed up with the extra sector traffic.
+
+### The source view: which line
+
+With `-lineinfo` and `--import-source yes`, the report attributes counters to each SASS instruction and source line. The GUI shows
+them side by side. On the command line, `top_sass.py` ranks the instructions by stall samples:
+
+```bash
+ncu -i strided.ncu-repz --page source --print-source sass --csv | python3 top_sass.py
+```
+
+```text title="output: scale_strided"
+ stall samples   L2 sectors / ideal  instruction
+        56.8%                       FADD R7, R2, R2
+        23.4%                       BRA `(.L_x_0) 0x100052a99e0
+        11.5%                       IMAD R0, R0, c[0x0][0x0], R3
+         3.5%                 8.0x  LDG.E R2, [R2.64]
+         2.7%                 8.0x  STG.E [R4.64], R7
+         1.6%                       S2R R3, SR_TID.X
+```
+
+Two lessons here, both easy to misread:
+
+- **Stalls land on the instruction that waits, not the one that caused the wait.** Most of the samples are on `FADD R7, R2, R2`, which
+  computes `2.0f * x[j]` as `x + x`. It can't start until `R2` arrives from the `LDG` above it. The culprit is the load, whose
+  sectors-per-ideal column says **8.0×**: it moves eight times the sectors a coalesced access would.
+- **The `BRA` at the end** is the exit, where warps sit in the "drain" stall waiting for their uncoalesced `STG` stores to complete.
+
+That's level 3 of the method: from "the strided kernel is 95% of the time" (nsys) to "the global load and store at line 35 move 8× the
+ideal sectors" (ncu). The fix is the one from [4.7](/learn/m04/coalesced-vs-strided): change the indexing so neighbouring threads touch
+neighbouring addresses, or stage the data through shared memory.
+
+## When a counter is wrong
+
+Back to the Speed of Light table. `scale_coalesced` reads 64 MB and writes 64 MB in 852.74 µs. That's 157 GB/s, which is **94%** of
+this GPU's 168 GB/s peak, matching the event timing in the lab output. Nsight Compute said **47%**. Asking for the raw counters shows why:
+
+```text title="ncu: scale_coalesced, raw counters"
+    lts__t_sectors_srcunit_tex_op_read.sum     sector    2,097,152     (L2: 64 MB read, correct)
+    lts__t_sectors_srcunit_tex_op_write.sum    sector    2,097,152     (L2: 64 MB written, correct)
+    dram__bytes_read.sum                        Mbyte        22.38     (one third of 67.1 MB)
+    dram__bytes_write.sum                       Mbyte        22.29
+    dram__bytes.sum.peak_sustained         byte/cycle           16
+    dram__cycles_elapsed.avg.per_second          Ghz         6.99
+```
+
+The L2 counters see exactly the traffic the kernel must cause. The DRAM counters see **a third** of it, and the peak they compare
+against (16 bytes × 6.99 GHz ≈ 112 GB/s) is two thirds of the real one, so the percentage comes out at half the true value. We didn't
+find a documented reason. It may be specific to this laptop GPU or to this profiler version. Either way, a profiler can report a wrong
+number with full confidence.
+
+<Callout type="warning" title="Check counters against arithmetic">
+  Before believing a counter, work out what it should roughly be: bytes the kernel must move, FLOPs it must do, instructions per element.
+  Use the counter only if it agrees. On this GPU, use the L2 sector counts or your own bytes ÷ time for DRAM bandwidth, not the DRAM
+  percentage. When two sources disagree, as they did here, find out why before drawing any conclusion.
+</Callout>
+
+## Choosing a tool
+
+- **Start with Nsight Systems** on the real workload, with NVTX ranges around its phases. Look for idle GPU time, copies, syncs, and
+  which kernels dominate.
+- **Then Nsight Compute** on the one or two kernels that matter, with `-k` and `-c` so it doesn't replay everything. Start with Speed of
+  Light, then follow whichever ceiling is closest.
+- **Don't use Nsight Compute's durations as timings.** It locks the clocks and flushes the caches before each replay
+  ([7.3](/learn/m07/what-kernel-time-measures)). It's built to compare counters, not to time kernels.
+- **For PyTorch code**, the PyTorch profiler ([7.4](/learn/m07/pytorch-profiler)) gives a timeline at the level of operators, and
+  `nsys profile` works on `python` just as it does on a compiled program.
+
+## Lab: two profilers, one program 🔴
+
+```bash
+cd labs/m07/7.2 && nvcc -O2 -arch=native -lineinfo tools.cu -o tools && ./tools
+nsys profile -t cuda,nvtx -o tools ./tools
+nsys stats -r nvtx_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum tools.nsys-rep
+nsys export -t sqlite -o tools.sqlite tools.nsys-rep && python3 step_timeline.py tools.sqlite
+ncu -k regex:scale -c 2 --section SpeedOfLight --section Occupancy --section WarpStateStats \
+    --section SourceCounters --import-source yes -o scale ./tools && ncu -i scale.ncu-repz
+ncu -k regex:scale_strided -c 1 --section SourceCounters --section WarpStateStats --import-source yes -o strided ./tools
+ncu -i strided.ncu-repz --page source --print-source sass --csv | python3 top_sass.py
+```
+
+If `ncu` stops with `ERR_NVGPUCTRPERM`, the driver only lets root read GPU counters. Either run `ncu` with `sudo`, or allow it for all
+users: add `options nvidia NVreg_RestrictProfilingToAdminUsers=0` to a file in `/etc/modprobe.d/`, rebuild the initramfs and reboot.
+On a shared machine, that lets every local user read the counters.
+
+<Callout type="note" title="Exercises">
+  1. Move `cpu_postprocess` so it overlaps with the next step's GPU work (hint: launch step $i + 1$ before post-processing step $i$, with a
+     second result buffer). Confirm on the timeline that the gap is gone. How much faster is the step?
+  2. Fix `scale_strided` by changing only the index calculation. Check that ncu reports 4 sectors per request and that the stall
+     samples move off the `FADD`.
+  3. Split the 64 MB copy into 4 chunks on 4 streams, each followed by its share of the kernels. What does the timeline look like now?
+  4. Run `ncu --set full` on `sum_kernel`. Which section shows that it reads `y` at nearly full bandwidth? Check the counter against
+     your own bytes ÷ time.
+  5. Profile the 4.6 lab with `nsys profile ./streams` and find the overlapping copies and kernels.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Phase 4, The Measurement Mandate (Ch 55: Nsight Systems vs Compute)." />
+  <SourceCard id="CUDA100" note="Profiling kernels along the way: coalescing, occupancy, timing." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Your inference loop is slower than expected and you have no idea why. Which tool first?',
+      options: [
+        'Nsight Compute with --set full on every kernel',
+        'Nsight Systems on the whole program, to see idle time, copies and which kernels dominate',
+        'Read the SASS',
+        'Raise the block size',
+      ],
+      answer: 1,
+      explain: 'The timeline tells you where the time goes. Only then is it worth replaying one kernel under Nsight Compute.',
+    },
+    {
+      q: 'An NVTX range around a cudaMemcpy of 4 bytes lasts 24 ms. What does that mean?',
+      options: [
+        'PCIe is extremely slow',
+        'The CPU was waiting inside cudaMemcpy for the earlier work in the stream to finish',
+        'NVTX adds 24 ms of overhead',
+        'The copy ran 24 times',
+      ],
+      answer: 1,
+      explain: 'A synchronous copy waits for the stream. The range measures the wait; the copy itself took about 1 µs.',
+    },
+    {
+      q: 'Nsight Compute reports 32 sectors per global load request. What is the likely cause?',
+      options: [
+        'Perfect coalescing',
+        'Each lane of the warp touches a different 32-byte sector: a strided or scattered access',
+        'Bank conflicts in shared memory',
+        'Register spills',
+      ],
+      answer: 1,
+      explain: 'A coalesced 4-byte load by 32 lanes needs 4 sectors. 32 means every lane hit its own sector.',
+    },
+    {
+      q: 'Most stall samples sit on an FADD that uses a value loaded by the previous LDG. What should you fix?',
+      options: ['The FADD', 'The LDG: the stall is reported on the instruction that waits for its result', 'The branch', 'Nothing'],
+      answer: 1,
+      explain: 'Stall samples land on the consumer. Look one step back to the instruction that produced the operand.',
+    },
+    {
+      q: 'Nsight Compute says a copy kernel reaches 47% of DRAM bandwidth, but bytes ÷ time gives 94%. What do you do?',
+      options: [
+        'Trust the profiler',
+        'Check the raw counters against the bytes the kernel must move, and find out which is wrong',
+        'Average the two',
+        'Assume the timer is wrong',
+      ],
+      answer: 1,
+      explain: 'Here the DRAM counters saw one third of the traffic that the L2 counters, and the arithmetic, agreed on.',
+    },
+  ]}
+/>

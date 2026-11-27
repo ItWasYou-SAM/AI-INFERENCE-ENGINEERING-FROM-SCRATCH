@@ -1,0 +1,267 @@
+---
+summary: "Most inference code is PyTorch, and PyTorch has its own profiler. It records every operator on the CPU and every kernel on the GPU, ties them together, and exports a trace you can open in a browser. This chapter profiles a small GPT-style stack three ways (a prefill, a prefill with a hidden sync, and a one-token decode step) and reads what each trace says."
+duration: 25 min
+objectives:
+  - Profile a PyTorch model with torch.profiler, using a schedule to skip warm-up, and label regions with record_function
+  - "Read the operator table: self vs total time, CPU vs GPU time, and the rows that mislead"
+  - Open a trace in Perfetto and find GPU idle time, launches and syncs
+  - Tell a GPU-bound step from a host-bound one, and estimate what a hidden .item() costs
+  - Hand off from the PyTorch profiler to Nsight Systems and Nsight Compute
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Nsight Systems shows kernels and CUDA calls ([7.2](/learn/m07/nsight-systems-vs-compute)), but a PyTorch program is made of *operators*:
+`aten::linear`, `aten::layer_norm`, `aten::scaled_dot_product_attention`. Each one runs some Python, dispatches through PyTorch's C++
+layers, and launches one or more kernels. `torch.profiler` sees both sides: it records operators on the CPU and, through NVIDIA's CUPTI
+library, the kernels they launch on the GPU, with a link from each launch to its kernel.
+
+## Using it
+
+The pattern, from `labs/m07/7.4/profile_block.py`:
+
+```python
+from torch.profiler import ProfilerActivity, profile, record_function, schedule
+
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+             schedule=schedule(wait=1, warmup=2, active=5)) as prof:
+    for _ in range(8):
+        model(x, caches, pos)
+        torch.cuda.synchronize()
+        prof.step()                     # tells the schedule a step has ended
+
+prof.export_chrome_trace("traces/prefill.json")     # open at https://ui.perfetto.dev
+print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+```
+
+- **`schedule`** skips the first step (`wait`), runs the profiler without recording for two more (`warmup`: CUPTI's own setup costs land
+  there), then records five (`active`). Never profile the first iterations: they hold one-time costs ([7.3](/learn/m07/what-kernel-time-measures)).
+- **`record_function("attention")`** labels a region. The labels become rows in the trace, so you can see which kernels belong to which part
+  of the model.
+- Useful options: `record_shapes=True` adds input shapes to each operator, `with_stack=True` adds the Python line that called it,
+  `profile_memory=True` tracks allocations.
+
+The model is six transformer layers with $d = 1024$ and 16 heads, in FP16: LayerNorm, a fused QKV projection, `scaled_dot_product_attention`
+against a KV cache, an output projection, and a GELU MLP. It's small enough for a 6 GB GPU and has the same structure as a real model.
+
+## Prefill: the GPU is busy
+
+One sequence of 512 tokens:
+
+```text title="output (RTX 3050 6GB Laptop, torch 2.15)"
+=== prefill: 512 token(s), 6 layers, d = 1024, torch.float16  (cuda)
+step (wall clock, no profiler): 6.90 ms (range 6.89-7.89)   matmul TFLOP/s: 11.20
+GPU busy: 97% of the profiled steps (72 kernels per step)
+CPU in kernel launches: 72 launches, 0.20 ms per step (with profiler overhead)
+CPU waiting in cudaDeviceSynchronize: 1 calls, 4.80 ms per step
+kernel time: 6.49 ms per step
+  GPU ms/step  share  calls  avg us  kernel
+        3.113    48%     12   259.4  sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize192x128x32_stage3_warpsi
+        2.067    32%     12   172.3  sm80_xmma_gemm_f16f16_f16f32_f32_tn_n_tilesize64x96x32_stage4_warpsize
+        0.441     7%      6    73.4  void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits<64, 128,
+        0.320     5%      6    53.3  void at::native::vectorized_elementwise_kernel<4, at::native::GeluCUDA
+        0.202     3%     12    16.8  void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc
+        0.196     3%     12    16.3  void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_imp
+```
+
+"GPU busy" is computed by the lab from the exported trace: the share of the profiled steps during which at least one kernel was running.
+At **97%** the GPU barely waits for the host. The CPU spends 0.2 ms launching 72 kernels, about 2.8 µs each, then waits 4.8 ms in the
+final `synchronize` for the GPU to catch up. That's a GPU-bound step, and the table says where to look next:
+
+- **The GEMMs are 80%** of GPU time. The kernel names tell you a lot: `xmma_gemm_f16f16_f16f32` means FP16 inputs and FP32 accumulation
+  on tensor cores ([6.7](/learn/m06/tensor-cores-mixed-precision)), and cuBLAS picked a different tile size for the large MLP matmuls
+  than for the smaller projections. At 11.2 TFLOP/s for the matmuls alone, there's still room below this GPU's ~16 TFLOP/s cuBLAS
+  ceiling. The next step would be Nsight Compute on the first GEMM.
+- **Attention is 7%.** `scaled_dot_product_attention` dispatched to FlashAttention ([8.5](/learn/m08/flashattention)).
+- **Element-wise kernels are most of the remaining 13%**: GELU, bias and residual adds, layer norms. Each reads and writes a whole activation tensor.
+  Fusing them into neighbouring kernels is the subject of Module 8 ([8.1](/learn/m08/norms-fused-residual), [8.7](/learn/m08/torch-compile-cuda-graphs)).
+
+<Callout type="warning" title="Rows that mislead">
+  The profiler's default table also lists `record_function` labels and the `ProfilerStep#` markers, with GPU time summed over every
+  kernel inside them. In an early version of this lab, the table put `attention` at the top, with 325% of all CUDA time. Labels nest and
+  overlap, so their percentages don't add up to anything. Read them in the trace, not the table. The lab's own table keeps only kernels:
+  rows with GPU time and no CPU time of their own.
+</Callout>
+
+**Self vs total.** In the operator table, an operator's *total* time includes the operators it calls (`aten::linear` calls
+`aten::addmm`, which launches the GEMM), while its *self* time doesn't. Sort by self time to find what actually does the work. Sort by
+total time to see which high-level call it came from.
+
+## Prefill with a hidden sync
+
+Now add one line to every layer, the kind that ends up in real code for debugging:
+
+```python
+if self.debug_sync and x.abs().max().item() > 1e4:   # a harmless-looking check
+    print("activation blew up")
+```
+
+```text title="output"
+=== prefill + sync: 512 token(s), 6 layers, d = 1024, torch.float16  (cuda)
+step (wall clock, no profiler): 7.20 ms (range 7.17-7.43)   matmul TFLOP/s: 10.74
+GPU busy: 94% of the profiled steps (84 kernels per step)
+CPU in kernel launches: 84 launches, 0.21 ms per step (with profiler overhead)
+CPU waiting in cudaStreamSynchronize: 6 calls, 5.34 ms per step
+```
+
+`.item()` copies a GPU value to a Python number, so the CPU has to wait for the GPU to compute it: `cudaStreamSynchronize` now appears,
+6 times per step, once per layer. Each time, the queue of launched work runs dry. When the GPU finishes the layer, it sits idle until the
+CPU, released from the sync, launches the next one. The step got **0.30 ms (4%) slower**, and the GPU went from 97% to 94% busy. The
+extra `abs` and `max` kernels themselves are tiny (84 vs 72 kernels).
+
+4% is small here because launching is fast: 2.8 µs per kernel, so each sync exposes only a few tens of microseconds. That changes with the
+CPU. With the laptop in its power-saver profile, the same sync cost between 0.8 and 2.3 ms per step in repeated runs, 11–33%, because
+every launch after a sync took longer. A sync costs whatever the CPU then needs to get the GPU working again.
+
+<Callout type="insight" title="Where hidden syncs come from">
+  `.item()`, `.cpu()`, `.tolist()`, `print(tensor)`, `if tensor:`, `torch.nonzero` and boolean-mask indexing (the output size depends on
+  the data), `torch.cuda.synchronize()`, and copies from pageable memory. In a trace they all show up the same way: a
+  `cudaStreamSynchronize` or `cudaMemcpy` on the CPU thread, and a gap on the GPU stream right after it. In serving code, the classic
+  one is reading back sampled tokens every step to check for end-of-sequence.
+</Callout>
+
+## Decode: one token at a time
+
+Same model, one new token at position 511, attending to a 512-token KV cache:
+
+```text title="output"
+=== decode: 1 token(s), 6 layers, d = 1024, torch.float16  (cuda)
+step (wall clock, no profiler): 1.26 ms (range 1.26-1.27)   matmul TFLOP/s: 0.12
+GPU busy: 74% of the profiled steps (78 kernels per step)
+CPU in kernel launches: 78 launches, 0.19 ms per step (with profiler overhead)
+CPU waiting in cudaDeviceSynchronize: 1 calls, 0.06 ms per step
+kernel time: 1.23 ms per step
+  GPU ms/step  share  calls  avg us  kernel
+        0.668    54%     18    37.1  void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x
+        0.325    26%      6    54.2  std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int,
+        0.129    10%      6    21.6  void pytorch_flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<6
+        0.038     3%     12     3.2  void at::native::(anonymous namespace)::vectorized_layer_norm_kernel<c
+        0.027     2%     12     2.3  void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_imp
+        0.021     2%      6     3.4  void pytorch_flash::flash_fwd_splitkv_combine_kernel<Flash_fwd_kernel_
+```
+
+512× fewer tokens, but only 5.5× less time. The matmuls run at **0.12 TFLOP/s**, under 1% of what prefill reached. The kernels changed
+too: cuBLAS now picks small-tile and matrix-vector (`gemvx`) kernels, and attention uses FlashAttention's split-KV variant, which spreads one
+query's attention over several blocks so that more SMs have work ([9.5](/learn/m09/split-kv-flash-decoding)).
+
+Where does the time go? The six layers' weights are $6 \times 12 d^2 \times 2$ bytes $= 151$ MB, and every decode step has to read all
+of them. At the 157 GB/s this GPU reached in [7.2](/learn/m07/nsight-systems-vs-compute), that alone takes **0.96 ms**. The kernels take
+1.23 ms. So decode is **memory-bound on the weights**, as [3.4](/learn/m03/prefill-vs-decode) predicted, at about 78% of the bandwidth
+floor. Batching more sequences per step is what raises the work per byte.
+
+The other 26% is the GPU waiting. 78 kernels averaging 16 µs each are short enough that the CPU's 2.4 µs per launch, plus Python and
+dispatch, barely keeps up. That's the regime where CUDA Graphs ([4.6](/learn/m04/launch-async-streams), [8.7](/learn/m08/torch-compile-cuda-graphs))
+pay off.
+
+<Callout type="warning" title="The CPU decides decode speed">
+  With the laptop in its power-saver profile, the same decode step took about 2.8 ms instead of 1.26 ms, and the GPU was only about 25%
+  busy. Nothing changed but the CPU's clock. A host-bound step is only as fast as the host, so profile on the machine and in the power state
+  you'll serve from ([7.3](/learn/m07/what-kernel-time-measures)).
+</Callout>
+
+## Reading the trace
+
+`export_chrome_trace` writes a JSON file in the Chrome trace format. Open it at [ui.perfetto.dev](https://ui.perfetto.dev) (or
+`chrome://tracing`). You'll see:
+
+- **A CPU thread row** with the Python-level operators nested inside each other: `ProfilerStep#3` → `attention` → `aten::linear` →
+  `aten::addmm` → `cudaLaunchKernel`.
+- **A GPU stream row** with the kernels, and **flow arrows** from each `cudaLaunchKernel` to the kernel it started. A long arrow means
+  the kernel sat in the queue: the CPU is ahead. Kernels starting the moment their arrow arrives, with gaps in between, mean the GPU is
+  waiting for the CPU.
+- **Syncs** as long `cudaStreamSynchronize` or `cudaDeviceSynchronize` blocks on the CPU row. In the prefill + sync trace there are six per
+  step, each followed by a short gap on the GPU row.
+
+The "GPU busy" number in the lab comes from the same file. `gpu_busy_fraction` takes the union of all kernel intervals inside the
+profiled steps and divides it by the length of those steps. That's twenty lines of Python, worth keeping for any trace you collect.
+
+## Handing off to Nsight
+
+The PyTorch profiler stops at the kernel boundary. For more:
+
+- **Nsight Systems on a PyTorch program:** `nsys profile -t cuda,nvtx --pytorch=autograd-nvtx python profile_block.py --nsys` adds an
+  NVTX range for every operator, so the nsys timeline shows `aten::addmm` above its kernels. The two profilers can't both drive PyTorch's
+  autograd profiler at once, which is why the lab has a `--nsys` flag that skips `torch.profiler`. Per-operator ranges cost CPU time: under
+  this setup the decode step slowed from 1.26 to 1.83 ms, while prefill barely changed.
+- **Nsight Compute on one kernel:** `ncu -k regex:xmma_gemm -c 1 python profile_block.py` profiles the first matching GEMM, exactly as for a
+  compiled program.
+
+## Lab: three steps, three traces 🟡
+
+The lab runs on a CUDA GPU, or on a CPU, where it prints CPU operator tables only. On a GPU, use a PyTorch build with CUDA:
+
+```bash
+python -m venv labs/.venv && source labs/.venv/bin/activate
+pip install torch numpy                      # see pytorch.org for the right CUDA build for your driver
+cd labs/m07/7.4 && python profile_block.py   # writes traces/*.json
+```
+
+<Callout type="note" title="Exercises">
+  1. Open `traces/prefill_plus_sync.json` in Perfetto and find one of the six syncs. How long is the GPU idle after it?
+  2. Move the `.item()` check so it runs once per step instead of once per layer. How much of the 0.30 ms comes back?
+  3. Run decode with a batch of 8 sequences instead of 1. How do the step time and "GPU busy" change? Is it still memory-bound on the
+     weights?
+  4. Add `record_shapes=True` and print `prof.key_averages(group_by_input_shape=True).table(...)`. Which shapes do the two GEMM kernels
+     come from?
+  5. Wrap the model in `torch.compile(model, mode="reduce-overhead")` and profile decode again. What happened to the kernel count and
+     the launches ([8.7](/learn/m08/torch-compile-cuda-graphs))?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="FREGLY" note="The PyTorch profiling chapter: torch.profiler, traces, and finding host overhead." />
+  <SourceCard id="BGE" note="Phase 4, The Measurement Mandate (Ch 54: Observe, don't assume)." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'Why use schedule(wait=1, warmup=2, active=5) instead of profiling from the first step?',
+      options: [
+        'It makes the model faster',
+        'The first steps carry one-time costs (allocation, algorithm selection, CUPTI setup) that would distort the profile',
+        'The profiler cannot record the first step',
+        'To save disk space only',
+      ],
+      answer: 1,
+      explain: 'Warm-up steps are not representative. The schedule records only steady-state steps.',
+    },
+    {
+      q: 'A trace shows cudaStreamSynchronize on the CPU thread six times per step, each followed by a gap on the GPU. Likely cause?',
+      options: [
+        'The GPU is overheating',
+        'Something reads a GPU value back to Python, such as .item(), once per layer',
+        'FlashAttention',
+        'Too many CUDA streams',
+      ],
+      answer: 1,
+      explain: 'Each readback makes the CPU wait, so the launch queue drains and the GPU idles until the next launches arrive.',
+    },
+    {
+      q: 'Decode at batch 1 takes 1.26 ms; the weights are 151 MB and the GPU reads at 157 GB/s. What limits decode?',
+      options: [
+        'Tensor core throughput',
+        'Reading the weights from memory: 151 MB / 157 GB/s ≈ 0.96 ms of the 1.23 ms of kernel time',
+        'Attention FLOPs',
+        'The tokenizer',
+      ],
+      answer: 1,
+      explain: 'Every step reads every weight once to do very little math with it. That is memory-bound by definition.',
+    },
+    {
+      q: 'In the default operator table, a record_function label shows 325% of CUDA time. What does that mean?',
+      options: [
+        'The GPU ran 3.25× faster',
+        'Nothing useful: labels sum the time of every kernel inside them and nest, so their percentages do not add up',
+        'Three streams ran in parallel',
+        'A profiler bug that corrupts all rows',
+      ],
+      answer: 1,
+      explain: 'Use labels in the trace to see which kernels belong to which region; rank kernels by their own self time.',
+    },
+  ]}
+/>

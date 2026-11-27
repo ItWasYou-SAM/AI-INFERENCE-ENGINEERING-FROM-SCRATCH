@@ -122,13 +122,13 @@ _From a naive matmul to a tiled, tensor-core-aware kernel._
 
 _Nsight, the PyTorch profiler, and a top-down profiling discipline._
 
-**Sources:** `BGE` (Phase 4, Ch 52–56), `FREGLY` (PyTorch profiling chapter)
+**Sources:** `BGE` (Ch 52–56 (53–56 still placeholders upstream)), `FREGLY` (PyTorch profiling chapter)
 
 - **7.1** The top-down profiling discipline
 - **7.2** Nsight Systems vs Nsight Compute 🔴
 - **7.3** What kernel time actually measures
 - **7.4** The PyTorch profiler and traces 🟡
-- **7.5** Case study: the 91 missing TFLOPS 🔴
+- **7.5** Case study: the 10 missing TFLOPS 🔴
 
 ### M8 · Transformer kernels and compilers
 

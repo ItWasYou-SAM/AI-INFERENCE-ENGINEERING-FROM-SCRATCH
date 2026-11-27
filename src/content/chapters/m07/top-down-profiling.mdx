@@ -1,0 +1,201 @@
+---
+summary: "A GPU program can be limited by the host, by copies, by launch overhead, by memory bandwidth, by math, or by a dozen smaller ceilings, and intuition picks the wrong one most of the time. This chapter sets out the order in which to look: the whole timeline first, then the kernels that dominate it, then the one ceiling inside the worst kernel. Change one thing, then measure again."
+duration: 15 min
+objectives:
+  - State the rule "no change without a measurement that names the bottleneck", and say why intuition fails on GPUs
+  - Work through the top-down levels in order (program, timeline, kernel, instruction) and name the tool for each
+  - Use Amdahl's law to rank what to optimize before optimizing anything
+  - Recognize bottleneck migration as progress, and treat end-to-end time as the final judge
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Modules 4 to 6 kept producing numbers that surprised us. In [5.1](/learn/m05/reduction-trees), the three textbook fixes to the
+reduction tree (less divergence, no bank conflicts) made no difference at all; what doubled the speed was putting more loads in flight.
+The same reduction ran at 127 GB/s in one session and 162 GB/s in another, with the same code, because the laptop had lowered its memory
+clock. A launch that "costs nothing" turned out to take 2.7 µs ([4.6](/learn/m04/launch-async-streams)), as long as many decode kernels
+run.
+
+Each time, the measurement disagreed with the guess. This module turns that into a rule:
+
+<Callout type="insight" title="The rule">
+  Don't change code until a measurement has named the bottleneck you are changing it for. Afterwards, measure again and check that the
+  number you meant to move actually moved.
+</Callout>
+
+## Why guessing fails on a GPU
+
+A CPU program is usually limited by one obvious thing. A GPU program has many ceilings, and any one of them can be the limit:
+
+| Ceiling | Where it lives | Seen in |
+|:--|:--|:--|
+| Host work: Python, tokenization, scheduling | CPU | [4.8](/learn/m04/when-not-to-use-a-gpu) |
+| Host-device copies, implicit syncs | PCIe, the stream queue | [4.3](/learn/m04/host-device-memory), [4.6](/learn/m04/launch-async-streams) |
+| Launch overhead, tiny kernels | driver, front end | [4.6](/learn/m04/launch-async-streams) |
+| Too few blocks, partial waves | the grid | [6.5](/learn/m06/wave-quantization) |
+| DRAM bandwidth | HBM / GDDR | [3.1](/learn/m03/compute-vs-memory-bound), [4.7](/learn/m04/coalesced-vs-strided) |
+| Shared-memory bandwidth, bank conflicts | the SM | [6.2](/learn/m06/register-tiling), [6.4](/learn/m06/bank-conflicts) |
+| Latency: too few warps or too little ILP | the SM | [2.5](/learn/m02/occupancy-latency-hiding), [6.6](/learn/m06/latency-hiding-ilp) |
+| Registers, spills, occupancy | the SM | [6.3](/learn/m06/register-pressure-spilling) |
+| Math throughput (FP32, tensor cores) | the SM | [6.7](/learn/m06/tensor-cores-mixed-precision) |
+
+At any moment a kernel is held back by one or two of these, and the others don't matter. Speeding up something that isn't the
+limit changes nothing. It can even make things worse: unrolling a loop to add ILP can raise register use until occupancy drops
+([6.3](/learn/m06/register-pressure-spilling)).
+
+The ceilings also hide each other. A kernel that looks slow may not be the problem at all. The GPU may simply be idle between kernels,
+waiting for Python to launch the next one.
+
+## Top-down: four levels, in order
+
+Look from the outside in. Each level tells you where to look at the next one, and each has a tool built for it.
+
+**Level 0: the whole program.** Time end to end with a wall clock: requests per second, tokens per second, step time. This is the number
+users feel, and the one every later change must improve. Write it down before touching anything.
+
+**Level 1: the timeline.** Is the GPU busy? Record a timeline of CPU threads, API calls, copies and kernels with **Nsight Systems** or the
+**PyTorch profiler** ([7.2](/learn/m07/nsight-systems-vs-compute), [7.4](/learn/m07/pytorch-profiler)). Look for:
+
+- **Gaps** between kernels, where the GPU waits for the host: Python overhead, a data loader, a `.item()` that forces a sync.
+- **Copies** that don't overlap with compute, or happen every step.
+- **Many tiny kernels**, each shorter than its own launch cost.
+
+If the GPU sits idle for a large share of the timeline, no kernel tuning will help. Fix the host side first: batch the work, remove syncs,
+overlap copies, use CUDA Graphs.
+
+**Level 2: the kernels.** Once the GPU is busy, rank kernels by **total** GPU time: time per call × number of calls. Usually a handful
+account for most of it. For a transformer, that means the GEMMs, attention, and whatever unfused element-wise ops are left over.
+
+**Level 3: inside one kernel.** Only now, and only for the top kernel, open **Nsight Compute** ([7.2](/learn/m07/nsight-systems-vs-compute)).
+Compare its throughput with the roofline ([3.3](/learn/m03/roofline)): what fraction of peak memory bandwidth and of peak compute does it
+reach? That tells you which ceiling it's against. Then the detailed sections (memory traffic, warp stall reasons, occupancy, and
+source-level counters) point to the line responsible.
+
+<Callout type="note" title="An idle GPU is a symptom, not a diagnosis">
+  Low GPU utilization tells you the GPU is waiting, not what it is waiting for. The timeline answers that: a gap before each kernel means
+  the launches are late, a long copy means data movement, and a CPU thread stuck in `cudaStreamSynchronize` means something asked for a
+  result too early.
+</Callout>
+
+## Rank before you optimize
+
+**Amdahl's law** sets the payoff. If a part takes a fraction $f$ of the total time and you make it $s$ times faster, the whole program
+speeds up by
+
+$$
+\text{speedup} = \frac{1}{(1 - f) + f / s}
+$$
+
+Make a kernel that takes 5% of the step **infinitely** fast and the step gets at most $1/0.95 \approx 1.05\times$ faster. Make the GEMMs
+that take 60% just 1.5× faster and the step gets $1/(0.4 + 0.4) = 1.25\times$ faster. Level 2 exists to find the large $f$ before you
+spend a week on $s$.
+
+There's a second ceiling for each kernel: the roofline. A memory-bound kernel that already moves its bytes at 90% of peak bandwidth can
+gain at most about 10% by tuning. To get more, it has to move fewer bytes, by fusing it with a neighbor or using a smaller data type.
+The [5.1](/learn/m05/reduction-trees) reduction reached 162 of about 168 GB/s. Once a kernel is that close to the limit, stop tuning it and
+move on.
+
+## One change, then measure
+
+Every optimization is an experiment. Do it like one:
+
+1. **Hypothesis.** Name the bottleneck and the metric that should move. For example: "the inner loop is limited by shared-memory loads,
+   so register tiling will lower the shared-memory load count per FMA."
+2. **Change one thing.** If you change two things and the time improves, you don't know which one helped, or whether one of them hurt.
+3. **Measure the targeted metric and the end-to-end time.** Did the metric move? Did the time? If the metric moved but the time didn't,
+   that metric wasn't the bottleneck.
+4. **Keep it or revert it.** A change that doesn't pay for its complexity is removed.
+
+Keep the conditions fixed while you measure. The [5.1](/learn/m05/reduction-trees) episode shows why: the same kernel measured 127 and
+162 GB/s depending on the laptop's power state. Measure with a warm GPU, the same clocks, the same input, and enough repetitions to see
+the noise. [7.3](/learn/m07/what-kernel-time-measures) covers what the timer actually measures.
+
+## Bottleneck migration is progress
+
+Fix one limit and another takes its place. Reduce launch overhead with CUDA Graphs, and the timeline is suddenly full of kernels, so now
+the GEMMs dominate. Tile the GEMM, and shared-memory bandwidth gives way to latency, then to the FP32 units. This isn't failure: **the
+bottleneck moving means you removed one**. At the serving level the same thing happens on a larger scale: compute, KV-cache memory, the
+scheduler and the network take turns being the limit as load grows.
+
+So the loop is: measure, find the limit, remove it, measure again. Stop when the remaining limit is a ceiling of the hardware (peak
+bandwidth or peak FLOP/s), or when the end-to-end target is met.
+
+<Callout type="warning" title="Wall-clock time is the judge">
+  Profilers count events and estimate fractions. Users feel latency and throughput. A change that improves every profiler metric but not
+  the end-to-end number didn't work. One that makes a kernel slower but removes a sync from the step may well be a win.
+</Callout>
+
+## The method in one page
+
+| Level | Question | Tool | Typical fixes |
+|:--|:--|:--|:--|
+| 0. Program | How fast is it, end to end? | wall clock, benchmark script | (set the baseline) |
+| 1. Timeline | Is the GPU busy? Where are the gaps? | Nsight Systems, PyTorch profiler | batch, remove syncs, overlap copies, CUDA Graphs |
+| 2. Kernels | Which kernels take the most total time? | kernel summary from either tool | fuse, pick better library kernels, change shapes |
+| 3. One kernel | Which ceiling is it against, and why? | Nsight Compute | coalescing, tiling, occupancy, tensor cores |
+
+The rest of the module covers the tools ([7.2](/learn/m07/nsight-systems-vs-compute), [7.4](/learn/m07/pytorch-profiler)), what their
+numbers mean ([7.3](/learn/m07/what-kernel-time-measures)), and then applies the method from start to finish to one case
+([7.5](/learn/m07/missing-tflops)).
+
+<Callout type="note" title="Exercises">
+  1. A decode step takes 20 ms. The timeline shows 14 ms of kernels and 6 ms of gaps. GEMMs are 9 ms of the kernel time. What is the
+     best possible speedup from making the GEMMs 2× faster? From removing all the gaps?
+  2. Pick a lab from Module 6 and write its optimizations as hypotheses: which metric did each one target, and did that metric move?
+  3. A kernel reaches 85% of peak DRAM bandwidth. Name two changes that could make it faster and one that can't.
+  4. You add `__launch_bounds__` and the kernel gets 10% faster, but the end-to-end step doesn't change. List three possible reasons.
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Ch 52: Measure, don't guess, the top-down profiling discipline." />
+  <SourceCard id="ICP" note="Bottleneck migration at the serving level." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'A PyTorch inference loop shows the GPU at 40% utilization. What should you look at first?',
+      options: [
+        'Nsight Compute on the slowest kernel',
+        'A timeline of the gaps between kernels, to see what the GPU is waiting for',
+        'Rewrite the attention kernel',
+        'Raise occupancy',
+      ],
+      answer: 1,
+      explain: 'The GPU is idle 60% of the time. Tuning kernels only shrinks the busy 40%; the timeline shows what causes the idle time.',
+    },
+    {
+      q: 'A kernel takes 4% of step time. You make it 3× faster. Roughly how much faster is the step?',
+      options: ['3×', '1.5×', 'About 1.03×', 'About 1.25×'],
+      answer: 2,
+      explain: '1 / (0.96 + 0.04/3) ≈ 1.027. A small fraction gives a small speedup, whatever s is.',
+    },
+    {
+      q: 'After you add CUDA Graphs, the GEMMs dominate the timeline. What does that mean?',
+      options: [
+        'The graphs made the GEMMs slower',
+        'Launch overhead was removed and the bottleneck moved, which is progress',
+        'Graphs should be removed',
+        'The profiler is wrong',
+      ],
+      answer: 1,
+      explain: 'With launch gaps gone, the GPU spends its time on real work, so the next limit shows up.',
+    },
+    {
+      q: 'You change the tile size and the shared-memory unroll factor at the same time, and the kernel gets 8% faster. What is the problem?',
+      options: [
+        'Nothing, it is faster',
+        'You cannot tell which change helped, or whether one of them made it slower',
+        '8% is within noise by definition',
+        'Tile size never matters',
+      ],
+      answer: 1,
+      explain: 'One change at a time keeps each measurement attributable.',
+    },
+  ]}
+/>
