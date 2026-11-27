@@ -1,0 +1,216 @@
+---
+summary: "\"The kernel took 1.2 ms\" can mean five different things, depending on who held the stopwatch: a CPU timer, CUDA events, Nsight Systems or Nsight Compute. Each one includes or leaves out launch overhead, queueing, warm-up, cache state and clock speed. This chapter takes the measurement apart, so that a number you report means what you think it means."
+duration: 15 min
+objectives:
+  - Explain why a CPU timer around a kernel launch measures the launch, not the kernel
+  - Say what CUDA events, Nsight Systems and Nsight Compute each measure, and why their numbers differ
+  - List the hidden variables in a GPU timing (warm-up, clocks, L2 cache state, input shape) and control each one
+  - Write a benchmark loop that gives a repeatable, honest number
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+Every throughput figure in this site is FLOPs or bytes divided by a time. If the time is wrong, so is the throughput, and so is every
+conclusion drawn from it. GPU timings go wrong in more ways than CPU timings, because the CPU and GPU run asynchronously, the hardware
+changes its clocks as it runs, and the caches remember the previous run.
+
+## The four stopwatches
+
+Look at a launch on a timeline again ([4.6](/learn/m04/launch-async-streams)). Each tool starts and stops its clock at a different point:
+
+| Stopwatch | Starts | Stops | Includes |
+|:--|:--|:--|:--|
+| CPU timer around the launch | CPU calls `kernel<<<>>>` | launch call returns | only the CPU cost of launching |
+| CPU timer + `cudaDeviceSynchronize` | CPU calls `kernel<<<>>>` | CPU sees the GPU idle | launch, queueing, the kernel, sync latency |
+| CUDA events in the stream | GPU reaches the start event | GPU reaches the stop event | the kernel and any gaps between kernels in the range |
+| Nsight Systems kernel row | first block starts | last block ends | the kernel only |
+| Nsight Compute "Duration" | first block starts | last block ends | the kernel only, alone on the GPU, under profiler-controlled clocks and caches |
+
+**The CPU timer around a launch** is the classic mistake. In [4.1](/learn/m04/kernels-are-not-functions) the launch returned after
+4.6 µs, while the kernel ran for 5 ms. The CPU timer measured the queue write, not the work.
+
+**Adding a sync** fixes that, but now the time includes the launch overhead (2.7 µs on our GPU, [4.6](/learn/m04/launch-async-streams))
+and the delay before the CPU notices the GPU is done. For a 5 ms kernel that doesn't matter. For a 5 µs kernel it can double the number.
+
+**CUDA events** are recorded *into the stream*, so the GPU timestamps them when it reaches them. This is what `GpuTimer` in the labs'
+`common.cuh` does. Events leave out the CPU side, and their resolution is about half a microsecond. Two things to know: the range covers
+everything the stream executes between the two events, including idle gaps if the CPU is slow to submit work; and the first kernel in the
+range starts only when the GPU gets to it. Time many back-to-back launches between one pair of events, then divide.
+
+**Nsight Systems** records the start and end of every kernel on the GPU. Its kernel durations add up to the GPU's *busy* time. They do not
+add up to the step time, because the gaps between kernels aren't in any kernel.
+
+**Nsight Compute** measures something else again. To read hundreds of hardware counters it runs each kernel by itself, often several times
+(**replay**), and by default it:
+
+- **serializes** kernels, so nothing overlaps;
+- **flushes the caches** before each replay (`--cache-control all`), so every run starts with a cold L2;
+- **locks the SM clock** at a fixed value (`--clock-control boost` in recent versions, `base` is also available). On our RTX 3050 the
+  default lock is 1.49 GHz, while the same GEMM runs at 1.9–2.0 GHz without the lock.
+
+So Nsight Compute durations can differ a lot from the same kernel in a normal run. In the [7.5](/learn/m07/missing-tflops) lab, one
+FP16 GEMM took 3.27 ms under the default lock, 3.95 ms with `--clock-control base` (1.24 GHz) and 2.48 ms with `--clock-control none`. A
+memory-bound kernel barely notices: the [7.2](/learn/m07/nsight-systems-vs-compute) copy kernel took 853 µs locked and 855 µs free, because
+the lock applies to the SM clock, not the memory clock. That's deliberate: the conditions are repeatable,
+and the counters are comparable between runs. Use Nsight Compute for *why* (which ceiling, which stall) and Nsight Systems or events for
+*how long*.
+
+<Callout type="insight" title="Step time is not the sum of kernel times">
+  $$
+  t_\text{step} = t_\text{host, not overlapped} + \sum_i t_{\text{kernel},i} + t_\text{gaps}
+  $$
+  Most tools report the middle term well, and most problems in small-batch inference live in the other two.
+</Callout>
+
+## The hidden variables
+
+The same kernel, binary and input can still produce different times. These are the usual reasons.
+
+**Warm-up.** The first call pays one-time costs: the CUDA context, loading the kernel's module (CUDA loads modules lazily by default, on
+first use), cuBLAS creating its handle and picking an algorithm, PyTorch's caching allocator getting memory from the driver, and
+`torch.compile` or Triton compiling and autotuning. The first iteration can be thousands of times slower than the tenth. Always run a few
+iterations before you start timing, and never report the first one.
+
+**Clocks.** A GPU runs at a **boost clock** that depends on temperature and power. A laptop GPU also lowers its **memory clock** on
+battery or when hot. That is why the [5.1](/learn/m05/reduction-trees) reduction measured 127 GB/s in one session and 162 GB/s in another,
+with the same code. Check clocks during the run with `nvidia-smi -q -d CLOCK` or `nvidia-smi dmon`. On a server, administrators can lock
+them (`nvidia-smi -lgc`, root required), which makes results repeatable at the price of not matching production.
+
+On a power-limited GPU the clock also depends on **what else the program does**. In the [7.5](/learn/m07/missing-tflops) lab the same FP32
+GEMM took 9.19 ms in one version and 9.95 ms in the next. Nsight Systems' clock samples showed why: 1507 MHz in the version that left the
+GPU idle between steps, 1387 MHz in the one that kept it busy. The ratio of the times (1.082) is close to the ratio of the clocks (1.087).
+
+**The CPU's clock counts too.** A step that is limited by the host gets faster or slower with the CPU's power settings. In the
+[7.4](/learn/m07/pytorch-profiler) lab, switching the laptop from its power-saver profile to performance took a one-token decode step from
+about 2.8 ms to 1.27 ms, with no change to the code. Write down the power profile along with the GPU clocks.
+
+**Cache state.** Run a kernel twice on the same small input and the second run may find its data still in L2. Our RTX 3050 has 2 MB of
+L2; an H100 has 50 MB. That's enough to hold the weights of a small layer, so a "bandwidth" benchmark that reuses one buffer can report
+more than DRAM can deliver. If the real workload streams data the cache hasn't seen, write a buffer larger than L2 between iterations, or
+rotate through several input buffers. If the real workload *does* reuse data (a decode loop reading the same KV cache), a warm cache may be
+the honest choice. Decide which one you are measuring and say so.
+
+**Shape.** Libraries pick different kernels for different shapes, and grids quantize into waves ([6.5](/learn/m06/wave-quantization)).
+A GEMM at $N = 4096$ tells you little about $N = 4100$. Benchmark the shapes your model actually runs.
+
+**Everything else on the GPU.** A desktop compositor, another process, or a second stream competes for the same SMs. On a laptop, the
+display may share the GPU. Close what you can, and look at the timeline if numbers jump.
+
+## Noise and statistics
+
+Repeated runs never give exactly the same time. Report a **median** over many iterations, since it ignores the occasional slow run caused
+by an interrupt or a clock change. Look at the spread too: if the fastest and slowest runs differ by 20%, a 5% "improvement" means nothing.
+The **minimum** is sometimes reported as "the hardware's best", but it hides real variation that users will see.
+
+## A benchmark loop that tells the truth
+
+In CUDA C++, with the labs' `GpuTimer`:
+
+```cpp
+for (int i = 0; i < 10; i++) kernel<<<grid, block>>>(args);      // warm-up: module load, clocks, caches
+CUDA_CHECK(cudaDeviceSynchronize());
+
+const int iters = 100;
+GpuTimer t;
+t.start();
+for (int i = 0; i < iters; i++) kernel<<<grid, block>>>(args);   // back to back: launch cost overlaps
+float ms = t.stop_ms() / iters;                                  // events: GPU timeline only
+```
+
+In PyTorch the same rules apply, and the classic bug is forgetting that CUDA ops are asynchronous:
+
+```python
+import time, torch
+
+x = torch.randn(4096, 4096, device="cuda", dtype=torch.float16)
+for _ in range(10):                      # warm-up: cuBLAS picks its algorithm here
+    y = x @ x
+torch.cuda.synchronize()
+
+start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+start.record()
+for _ in range(100):
+    y = x @ x
+end.record()
+end.synchronize()
+ms = start.elapsed_time(end) / 100
+
+# Wrong: time.perf_counter() around x @ x without a synchronize measures the launch, not the matmul.
+```
+
+`triton.testing.do_bench` packages this pattern: it warms up, times with events, and clears the L2 between runs by writing a large buffer.
+
+<Callout type="warning" title="Hidden syncs change what you measure">
+  A `print(y)`, `y.item()`, `y.cpu()` or `torch.cuda.synchronize()` inside the timed loop makes the CPU wait for the GPU each iteration.
+  The launch overhead stops overlapping with the kernel, and you measure a mix of the two. Keep the loop free of anything that reads a
+  result back.
+</Callout>
+
+## Which number to report
+
+- For **a kernel's speed**: events around many back-to-back launches, after warm-up, with the cache state you chose. Report the median and
+  the conditions: GPU, clocks, shape, data type.
+- For **a whole step or request**: a wall clock around the real code path, with syncs where the real code has them. This is the number
+  [7.1](/learn/m07/top-down-profiling) calls the judge.
+- For **why a kernel is slow**: Nsight Compute's counters, not its duration.
+- For **where the time goes**: the timeline in Nsight Systems or the PyTorch profiler ([7.2](/learn/m07/nsight-systems-vs-compute),
+  [7.4](/learn/m07/pytorch-profiler)).
+
+<Callout type="note" title="Exercises">
+  1. Time a 5 µs kernel three ways: a CPU timer around the launch only, a CPU timer with `cudaDeviceSynchronize` around a single launch,
+     and events around 1,000 launches. Explain each number.
+  2. Write a bandwidth test that copies a 1 MB buffer 1,000 times. Then rotate through 64 different 1 MB buffers. On a GPU with 2 MB of L2,
+     which run reports more than DRAM bandwidth, and why?
+  3. Time `x @ x` in PyTorch on the first call and on the hundredth. Then run with `nvidia-smi dmon` in another terminal and watch the
+     clocks while the loop runs.
+  4. A paper reports a kernel as "1.8× faster than cuBLAS" using Nsight Compute durations for both. What conditions would you want to check?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="CUDA100" note="Days 1–7: launching and timing kernels correctly." />
+  <SourceCard id="BGE" note="Phase 4, The Measurement Mandate (Ch 56: What kernel time measures)." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'You wrap a kernel launch in time.perf_counter() with no synchronize and get 6 µs. The kernel does 2 GFLOP. What did you measure?',
+      options: ['The kernel', 'The CPU cost of launching it', 'The kernel plus launch', 'GPU idle time'],
+      answer: 1,
+      explain: 'Launches are asynchronous: the call returns once the command is queued, long before the kernel finishes.',
+    },
+    {
+      q: 'Nsight Compute reports a kernel as 20% slower than events do in your benchmark. Why is that expected?',
+      options: [
+        'Nsight Compute is buggy',
+        'By default it locks the SM clock to a fixed value and flushes caches before each replay',
+        'Events are inaccurate',
+        'It includes launch overhead',
+      ],
+      answer: 1,
+      explain: 'A locked clock and cold caches make the run repeatable, but not the same as a warm run at whatever clock the GPU picks.',
+    },
+    {
+      q: 'A memory-bound kernel on a 168 GB/s GPU reports 300 GB/s when run repeatedly on a 1 MB buffer. Most likely cause?',
+      options: ['Compression', 'The buffer stays in L2 between runs', 'Event timing error', 'Tensor cores'],
+      answer: 1,
+      explain: 'A buffer smaller than L2 is served from cache on later runs, so the kernel never touches DRAM.',
+    },
+    {
+      q: 'The sum of all kernel durations in a step is 12 ms, but the step takes 17 ms. Where are the other 5 ms?',
+      options: [
+        'Measurement error',
+        'Gaps between kernels and host work that does not overlap with the GPU',
+        'Kernels running in parallel',
+        'Nsight overhead',
+      ],
+      answer: 1,
+      explain: 'Kernel durations only cover busy time. Idle GPU time between kernels is part of the step.',
+    },
+  ]}
+/>

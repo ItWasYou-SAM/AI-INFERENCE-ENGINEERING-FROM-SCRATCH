@@ -1,0 +1,353 @@
+---
+summary: "An FP16 transformer MLP block on our RTX 3050 runs at 5.9 TFLOP/s. cuBLAS runs the same two matmuls at 16.1. This chapter finds the missing 10 TFLOP/s with the top-down method, one level at a time: a timeline, a kernel table, one kernel's counters, then the kernel table again. Four fixes take the block to 15.9 TFLOP/s, and along the way the GPU's own clock turns out to be part of the story."
+duration: 30 min
+objectives:
+  - Apply the top-down method from start to finish to a realistic piece of inference code
+  - Recognize from kernel names alone an FP32 GEMM, a misaligned GEMM and a tensor-core GEMM
+  - Explain why a hidden size like 5461 is slower than 5632, and why models round their dimensions
+  - Fuse element-wise work into GEMM epilogues with cuBLASLt
+  - Account for a speedup in time, and explain why some fixes saved more time than the kernels they removed
+---
+import Callout from '../../../components/ui/Callout.astro';
+import SourceCard from '../../../components/ui/SourceCard.astro';
+import Sources from '../../../components/ui/Sources.astro';
+import Quiz from '../../../components/ui/Quiz.tsx';
+
+This chapter applies the method from [7.1](/learn/m07/top-down-profiling) from start to finish, on code that looks like real inference code
+and has the problems such code often has. Nothing in it is contrived to be slow on purpose: each problem below is one that turns up in
+practice.
+
+## The workload
+
+The MLP block of a transformer layer, for a prefill of 2048 tokens, in FP16:
+
+$$
+y = x + \operatorname{GELU}(x W_1)\, W_2 \qquad x: 2048 \times 2048,\quad W_1: 2048 \times H,\quad W_2: H \times 2048
+$$
+
+with $H = 5461$, which is $\tfrac{8}{3} \times 2048$, the usual ratio for a gated MLP's hidden size. The two matmuls do
+$2 \times 2 \times 2048 \times 2048 \times 5461 = 91.6$ GFLOP of useful work per step.
+
+Version 0, `v0` in `labs/m07/7.5/mlp.cu`, is written the way such code often starts:
+
+- every step copies `x` to the GPU and `y` back, then checks `y` for NaNs on the CPU;
+- `W2` was loaded in FP32, so the second matmul runs as an FP32 GEMM, with the GELU output converted to FP32 to match;
+- GELU and the residual add are separate kernels.
+
+## Level 0: how fast is it, and how fast should it be?
+
+```text title="output (RTX 3050 6GB Laptop, CUDA 13.5, cuBLAS 13.10)"
+MLP block, FP16: x 2048 x 2048, hidden 5461; 91.6 GFLOP of useful work per step
+  version                          step    TFLOP/s   max |y - y4|
+  v0 as written                15.53 ms       5.90        1.5e-03 PASS
+  ...
+  ceiling: cuBLAS GEMMs         5.69 ms      16.11   (both GEMMs alone, padded shape)
+```
+
+The step takes **15.53 ms**, which is **5.90 TFLOP/s**. The same two matmuls, run alone by cuBLAS in FP16 at a well-behaved shape, take 5.69
+ms: **16.1 TFLOP/s**. That's the realistic target, and it agrees with what cuBLAS reached on a 4096³ FP16 matmul in
+[6.7](/learn/m06/tensor-cores-mixed-precision). For reference, the hardware's own ceiling: an Ampere GeForce SM does 256 FP16
+multiply-adds per clock with FP32 accumulation, so 20 SMs at about 1.97 GHz give about 20 TFLOP/s.
+
+So about **10 TFLOP/s are missing**. Step time is the judge, measured with a wall clock around whole steps. Each version's time is the
+median of 7 rounds in which the versions take turns, so that all of them see the same GPU temperature and clock. Two separate runs agreed
+to within 0.3%.
+
+## Level 1: the timeline
+
+```bash
+nsys profile -t cuda,nvtx -o v0 ./mlp 0
+nsys export -t sqlite -o v0.sqlite v0.nsys-rep && python3 ../7.2/step_timeline.py v0.sqlite 6 "v0 as written"
+```
+
+```text title="output: one step of v0"
+v0 as written #6: 15.88 ms
+     0.00 -   0.65 ms  CPU range   copy x in
+     0.08 -   0.74 ms  GPU copy    host to device
+     0.71 -  14.83 ms  CPU range   copy y out
+     0.74 -   4.08 ms  GPU kernel  Kernel2
+     4.08 -   4.51 ms  GPU kernel  gelu_to_float
+     4.52 -  13.87 ms  GPU kernel  ampere_sgemm_128x64_nn
+    13.87 -  14.08 ms  GPU kernel  residual_float
+    14.08 -  14.76 ms  GPU copy    device to host
+    14.83 -  15.88 ms  CPU range   NaN check on CPU
+```
+
+Kernels run from 0.74 to 14.08 ms: **13.3 of the 15.9 ms**, or 84%. The other 2.5 ms are the copy in (0.66 ms), the copy out (0.68 ms) and
+the CPU's NaN check (1.05 ms), during which no kernel runs. The CPU sits in "copy y out" for 14 ms, but the copy itself takes only the last
+0.68 ms of that: the rest is waiting for the kernels ([7.2](/learn/m07/nsight-systems-vs-compute)).
+
+**Fix 1:** keep the data on the GPU. In a real model, the MLP's input comes from the previous layer, already in GPU memory, and a NaN
+check belongs in a test, or in a single device-side flag read once per request.
+
+```text title="output"
+  v1 data stays on GPU         13.97 ms       6.56        1.5e-03 PASS
+```
+
+1.56 ms faster. That's less than the 2.5 ms of idle time removed, which we'll come back to.
+
+## Level 2: the kernel table
+
+The GPU is now busy all the time, so the question becomes which kernels take that time. `nvtx_kern_sum` splits the kernel table by NVTX
+range, one per version:
+
+```bash
+nsys profile -t cuda,nvtx -o all ./mlp && nsys stats -r nvtx_kern_sum all.nsys-rep
+```
+
+```text title="nsys: kernels in v1 (median per launch)"
+  ampere_sgemm_128x64_nn                                                       9.945 ms
+  cutlass::Kernel2<cutlass_75_tensorop_f16_s1688gemm_f16_128x128_nn_align1>    3.540 ms
+  gelu_to_float                                                                0.437 ms
+  residual_float                                                               0.208 ms
+```
+
+One kernel is **71%** of the step, and its name gives it away: `ampere_sgemm` is cuBLAS's **FP32** GEMM (the `s` is single precision). It runs
+on the ordinary FP32 cores, not the tensor cores ([6.7](/learn/m06/tensor-cores-mixed-precision)). The second matmul does half of the
+block's work, at 4.6 TFLOP/s.
+
+**Fix 2:** store `W2` in FP16, keep the GELU output in FP16, and run the second matmul through the same `cublasGemmEx` call as the first.
+
+```text title="output"
+  v2 W2 in FP16                 7.50 ms      12.21        2.0e-03 PASS
+```
+
+**6.47 ms saved**, two thirds of everything this chapter gains. In PyTorch the same mistake is one tensor left in `float32` after
+`model.half()`, or a module created after the cast. The profiler table would show `sgemm` or `ampere_sgemm` among the top kernels.
+
+## Level 3: inside one kernel
+
+Both matmuls now run on tensor cores. They take 3.53 ms each, which is 13.0 TFLOP/s per GEMM, below the 16 the ceiling line reaches. Again
+the name gives a clue:
+
+```text
+cutlass_75_tensorop_f16_s1688gemm_f16_128x128_nn_align1
+```
+
+- `cutlass_75`: a kernel built for Turing (sm_75), not Ampere (sm_80). It uses the older 16 × 8 × 8 tensor-core instruction (`1688`)
+  instead of Ampere's 16 × 8 × 16 (`16816`).
+- `align1`: the kernel can only assume its matrices are aligned to **one element**, 2 bytes. Ampere's fast GEMMs load tiles in 16-byte chunks, with
+  `cp.async` ([6.6](/learn/m06/latency-hiding-ilp)) or vector loads like the `int4` copies in 6.7's WMMA kernel, and that needs every row
+  to start on a 16-byte boundary. With $H = 5461$,
+  a row of $W_1$ is 10,922 bytes long, which isn't a multiple of 16, so cuBLAS has to fall back to a kernel that loads one element at a time.
+
+Nsight Compute shows what that costs. Here it is on the first GEMM of v2, next to the same GEMM with $H$ padded to 5632:
+
+```bash
+ncu --kernel-name-base demangled -k regex:gemm -s 8 -c 1 --section SpeedOfLight \
+    --metrics smsp__inst_executed.sum,l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum,... ./mlp 2
+```
+
+```text title="ncu: GEMM 1, H = 5461 (align1) vs H = 5632 (align8)"
+                                                   align1        align8
+    Duration (SM clock locked at 1.49 GHz)        3.39 ms       3.28 ms
+    smsp__inst_executed.sum                    70,347,712    26,006,016
+    l1tex__t_requests_pipe_lsu_mem_global_op_ld 11,272,192     1,081,344
+    l1tex__t_sectors_pipe_lsu_mem_global_op_ld 190,145,228    17,301,504
+    L1/TEX Cache Throughput                       84.48 %       18.14 %
+    Memory Throughput                             82.52 %       32.34 %
+    Compute (SM) Throughput                       44.37 %       47.23 %
+    Registers Per Thread                              247           222
+```
+
+The misaligned kernel executes **2.7× the instructions** and issues **10× the global load requests** to do (almost) the same work. Its L1 is
+84% busy, against 18%, so it's close to a second ceiling: Nsight Compute's own summary says "Memory is more heavily utilized than Compute,
+dominated by L1". The padded kernel spends its effort on tensor-core math instead.
+
+**Fix 3:** pad $H$ to 5632, a multiple of 256, with zero columns in $W_1$ and zero rows in $W_2$. GELU(0) = 0, so the padding adds nothing
+to $y$, and the output matches exactly. It costs 3.1% more FLOPs, which this chapter doesn't count as useful work.
+
+```text title="output"
+  v3 H padded to 5632           6.75 ms      13.57        2.0e-03 PASS
+```
+
+0.75 ms saved. Real models make this choice when they're designed: Llama's 7B model has $d = 4096$ and a hidden size of 11,008, which is
+$\tfrac{8}{3} \times 4096 = 10{,}922.7$ rounded up to a multiple of 256. GPT-2's vocabulary of 50,257 is often padded to 50,304 for the same
+reason ([6.5](/learn/m06/wave-quantization)).
+
+<Callout type="warning" title="The locked clock hides part of the difference">
+  Under Nsight Compute, the two kernels differ by only 3% (3.39 vs 3.28 ms). In the real run, the per-GEMM difference is 12% (3.53 vs
+  3.09 ms, from Nsight Systems). Nsight Compute locks the SM clock, so it can't see one effect: the misaligned kernel, with 2.7× the
+  instructions, makes the GPU run at a lower clock. See "The clock is part of the system" below.
+</Callout>
+
+## Level 2 again: what's left
+
+```text title="nsys: kernels in v3 (median per launch)"
+  cutlass::Kernel2<cutlass_80_tensorop_f16_s16816gemm_relu_f16_128x256_32x3_nn_align8>   3.092 ms  (x2)
+  gelu_half                                                                              0.323 ms
+  residual_half                                                                          0.159 ms
+```
+
+Now both GEMMs use Ampere `align8` kernels. (The `relu` in the name is just the kernel family cuBLAS picked. With no epilogue requested, it
+applies none.) The element-wise kernels are 0.48 ms, 7% of the step. Each one reads and writes a full activation tensor: GELU moves
+$2 \times 2048 \times 5632 \times 2$ bytes = 46 MB, and the residual add three 8 MB tensors.
+
+**Fix 4:** fuse them into the GEMMs. **cuBLASLt**, the more flexible interface to cuBLAS, can apply an **epilogue** to each output tile while
+it's still in registers:
+
+- GEMM 1 with `CUBLASLT_EPILOGUE_GELU`: computes `GELU(x W1)` and writes the result once.
+- GEMM 2 computes `D = A·B + β·C` with $\beta = 1$ and `C = x`: the residual add, for free.
+
+```cpp
+cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_GELU;
+cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi));
+...
+cublasLtMatmul(lt, op, &one, B, b, A, a, &beta, C, c, D, c, &algo, ws, ws_bytes, stream);   // D = A B + beta C
+```
+
+The lab's `LtGemm` struct wraps this: it builds the descriptors, asks cuBLASLt's heuristic for an algorithm once, and reuses it.
+
+```text title="output"
+  v4 GELU, residual fused       5.76 ms      15.89        0.0e+00 PASS
+  ceiling: cuBLAS GEMMs         5.69 ms      16.11   (both GEMMs alone, padded shape)
+```
+
+0.99 ms saved, twice the 0.48 ms the two kernels took. v4 is now within 1.2% of the two GEMMs alone, which is the stopping rule from
+[7.1](/learn/m07/top-down-profiling): what's left is the library's own GEMM efficiency.
+
+## The account
+
+| Version | Fix | Found at | Step | TFLOP/s | Saved |
+|:--|:--|:--|--:|--:|--:|
+| v0 | (as written) | level 0 | 15.53 ms | 5.90 | |
+| v1 | data stays on the GPU | 1: timeline | 13.97 ms | 6.56 | 1.56 ms |
+| v2 | `W2` in FP16, tensor cores | 2: kernel table | 7.50 ms | 12.21 | 6.47 ms |
+| v3 | pad $H$ to 5632 | 3: one kernel | 6.75 ms | 13.57 | 0.75 ms |
+| v4 | GELU and residual in GEMM epilogues | 2: kernel table | 5.76 ms | 15.89 | 0.99 ms |
+
+Ten TFLOP/s recovered: **2.7× faster** with the same math and the same library. Account for speedups in **time**, not TFLOP/s. Times add
+up (1.56 + 6.47 + 0.75 + 0.99 = 9.77 ms), throughputs don't.
+
+The order matters. The timeline came first even though its fix was small, because until the GPU is busy all the time, the kernel table
+doesn't describe the step. The dtype fix was by far the biggest, and the kernel table found it at a glance. Neither of those needed
+Nsight Compute. Only the misalignment did, and it would have been easy to spend days on that one first.
+
+## The clock is part of the system
+
+Three of the fixes didn't save what simple arithmetic predicts. Removing 2.5 ms of idle time saved 1.56 ms. Removing 0.48 ms of
+element-wise kernels saved 0.99 ms. And the padding gain was four times larger in the real run than under Nsight Compute. The kernel
+table shows the same cuBLAS kernel at the same shape taking different times in different versions: the padded GEMM took 3.09 ms in v3,
+2.93 ms in v4 and 2.80 ms alone.
+
+Nsight Systems can sample the GPU's clock while it records the timeline. `clocks.py` assigns each kernel to the version that launched it
+and takes the median clock during those kernels:
+
+```bash
+nsys profile -t cuda,nvtx --gpu-metrics-devices=0 -o gm ./mlp
+nsys export -t sqlite -o gm.sqlite gm.nsys-rep && python3 clocks.py gm.sqlite
+```
+
+```text title="output: median SM clock during each version's kernels"
+  v0 as written                1507 MHz   (241 kernels)
+  v1 data stays on GPU         1387 MHz   (241 kernels)
+  v2 W2 in FP16                1402 MHz   (220 kernels)
+  v3 H padded to 5632          1588 MHz   (221 kernels)
+  v4 GELU, residual fused      1702 MHz   (150 kernels)
+```
+
+The clock moves by more than 20% between versions, and it explains the odd savings:
+
+- **v0 → v1:** the FP32 GEMM took 9.19 ms in v0 and 9.95 ms in v1. The ratio, 1.082, is close to the clock ratio 1507 / 1387 = 1.087. With no
+  idle gaps, the GPU ran at a lower clock, and every kernel got slower.
+- **v2 → v3 → v4:** fewer instructions, then less memory traffic, and the clock rose each time. The fixes saved work *and* let the
+  remaining work run faster.
+
+This laptop GPU runs against a power limit. It sets its clock according to how hard the whole program is working it, so a kernel's
+duration depends on what runs around it. Data-center GPUs have much more power headroom, but the same mechanism exists there too.
+Sampling the clock was the only way we found to see it, which is a good reason to run Nsight Systems with `--gpu-metrics-devices`
+when numbers don't add up.
+
+<Callout type="insight" title="Lessons that carry over">
+  1. Check the **dtype of every GEMM**: an FP32 matmul in an FP16 model is the most expensive one-line bug in inference.
+  2. Keep inner dimensions at **multiples of 64 or more** (16 bytes is the hard minimum for FP16), and pad when a ratio like 8/3 doesn't
+     divide evenly.
+  3. **Fuse element-wise work into the GEMM** when the library can do it: activations, bias and residual adds are standard epilogues
+     in cuBLASLt and CUTLASS.
+  4. **Read kernel names.** `sgemm`, `align1`, `cutlass_75` on an Ampere GPU: each one is a diagnosis.
+  5. Let **wall-clock time** decide. Profilers explain; they don't measure the user's experience.
+</Callout>
+
+## Lab: find the missing TFLOPS 🔴
+
+```bash
+cd labs/m07/7.5
+nvcc -O2 -arch=native -DUSE_CUBLAS mlp.cu -o mlp -lcublas -lcublasLt && ./mlp
+nsys profile -t cuda,nvtx -o v0 ./mlp 0 && nsys stats -r nvtx_sum,cuda_gpu_kern_sum v0.nsys-rep
+nsys export -t sqlite -o v0.sqlite v0.nsys-rep && python3 ../7.2/step_timeline.py v0.sqlite 6 "v0 as written"
+nsys profile -t cuda,nvtx -o all ./mlp && nsys stats -r nvtx_kern_sum all.nsys-rep
+ncu --kernel-name-base demangled -k regex:gemm -s 8 -c 1 --section SpeedOfLight ./mlp 2     # then ./mlp 3
+nsys profile -t cuda,nvtx --gpu-metrics-devices=0 -o gm ./mlp
+nsys export -t sqlite -o gm.sqlite gm.nsys-rep && python3 clocks.py gm.sqlite
+```
+
+`./mlp N` runs only version N, so each profile shows one version. In `ncu`, `-s 8` skips the 8 GEMM launches before the first timed step:
+2 for the reference output and 6 for the warm-up.
+
+<Callout type="note" title="Exercises">
+  1. Try $H = 5464$ (a multiple of 8, so 16-byte aligned rows) instead of 5632. Which kernel does cuBLAS pick, and how close does it
+     get to 5632?
+  2. Change v0's NaN check to run on the GPU: a kernel that sets a flag, read back once every 100 steps. How much of v0's idle time is
+     left?
+  3. Make v4's GEMM 1 use `CUBLASLT_EPILOGUE_GELU_BIAS` with a bias vector. Does the time change?
+  4. Run the block in BF16 instead of FP16 (`CUDA_R_16BF`). Same speed? Same accuracy against an FP32 reference?
+  5. Write the same MLP in PyTorch with one `nn.Linear` left in `float32`, and find it with the PyTorch profiler ([7.4](/learn/m07/pytorch-profiler)).
+     Which kernel name gives it away?
+</Callout>
+
+## Sources
+
+<Sources>
+  <SourceCard id="BGE" note="Ch 53 is titled after this case study, but upstream it's still a placeholder. The method is from Ch 52; the case here is our own, measured on the RTX 3050." />
+  <SourceCard id="FREGLY" note="Profiling GEMM-heavy workloads; mixed precision and fusion." />
+</Sources>
+
+<Quiz
+  client:visible
+  questions={[
+    {
+      q: 'The top kernel in an FP16 model is ampere_sgemm_128x64_nn. What does that tell you?',
+      options: [
+        'Tensor cores are working well',
+        'A matmul is running in FP32 on the CUDA cores: some weight or activation is float32',
+        'The model uses sparse matrices',
+        'cuBLAS is not installed correctly',
+      ],
+      answer: 1,
+      explain: 'sgemm is single-precision GEMM. In an FP16 model it means one operand was never cast.',
+    },
+    {
+      q: 'Why did H = 5461 select an align1 kernel?',
+      options: [
+        '5461 is prime',
+        'Rows of 5461 halves are 10,922 bytes, not a multiple of 16, so 16-byte vector loads cannot be used',
+        'cuBLAS only supports powers of two',
+        'The GPU has 20 SMs',
+      ],
+      answer: 1,
+      explain: 'Fast Ampere GEMMs load 16-byte chunks; any row start off a 16-byte boundary forces narrower loads.',
+    },
+    {
+      q: 'Fusing GELU and the residual add removed 0.48 ms of kernels but saved 0.99 ms. Why?',
+      options: [
+        'Measurement error',
+        'The GEMMs also got faster: with less total work the power-limited GPU ran at a higher clock (1588 → 1702 MHz)',
+        'The epilogue does less math',
+        'cuBLASLt uses a different GPU',
+      ],
+      answer: 1,
+      explain: 'The sampled clock rose in v4, and the same GEMM kernel ran faster as a result.',
+    },
+    {
+      q: 'Why fix the per-step copies first, even though the FP32 GEMM cost far more?',
+      options: [
+        'Copies are always the biggest problem',
+        'Until the GPU is busy all the time, the kernel table does not describe the step; top-down starts with the timeline',
+        'Nsight Compute cannot profile copies',
+        'It was the easiest',
+      ],
+      answer: 1,
+      explain: 'The timeline tells you whether kernel time is even the thing to optimize. Here it mostly was, but you only know after looking.',
+    },
+  ]}
+/>

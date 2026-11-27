@@ -174,13 +174,13 @@ export const levels: Level[] = [
         num: 7,
         title: "Profiling: measure, don't guess",
         tagline: 'Nsight, the PyTorch profiler, and a top-down profiling discipline.',
-        sources: [{ id: 'BGE', note: 'Phase 4, Ch 52–56' }, { id: 'FREGLY', note: 'PyTorch profiling chapter' }],
+        sources: [{ id: 'BGE', note: 'Ch 52–56 (53–56 still placeholders upstream)' }, { id: 'FREGLY', note: 'PyTorch profiling chapter' }],
         chapters: [
           c('7.1', 'top-down-profiling', 'The top-down profiling discipline'),
           c('7.2', 'nsight-systems-vs-compute', 'Nsight Systems vs Nsight Compute', { lab: 'gpu-required' }),
           c('7.3', 'what-kernel-time-measures', 'What kernel time actually measures'),
           c('7.4', 'pytorch-profiler', 'The PyTorch profiler and traces', { lab: 'gpu-optional' }),
-          c('7.5', 'missing-tflops', 'Case study: the 91 missing TFLOPS', { lab: 'gpu-required' }),
+          c('7.5', 'missing-tflops', 'Case study: the 10 missing TFLOPS', { lab: 'gpu-required' }),
         ],
       },
       {
