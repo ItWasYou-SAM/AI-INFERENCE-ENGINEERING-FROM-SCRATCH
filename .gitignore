@@ -7,6 +7,6 @@ __pycache__/
 .env
 video/trailer/out/
 video/promo/out/
-video/matmul/out/
+video/chapter-6-1/out/
 labs/.venv/
 labs/**/traces/

@@ -8,7 +8,7 @@
 //
 // Needs Chromium (CHROME=/usr/bin/chromium by default) and ffmpeg on PATH.
 // Serves the whole video/ folder, so the promo can share the trailer's fonts and logo.
-// VIDEO=matmul renders video/matmul/index.html instead (same --stills / --meta flags, output in video/matmul/out/).
+// VIDEO=chapter-6-1 renders video/chapter-6-1/index.html instead (same --stills / --meta flags, output in video/chapter-6-1/out/).
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { writeFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs';

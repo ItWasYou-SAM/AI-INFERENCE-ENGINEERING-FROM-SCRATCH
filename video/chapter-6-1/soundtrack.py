@@ -1,10 +1,10 @@
-"""Synthesize the matmul cut's soundtrack and mix in the narrator.
+"""Synthesize the chapter 6.1 walk-through's soundtrack and mix in the narrator.
 
-    python3 video/matmul/soundtrack.py      -> video/matmul/out/soundtrack.wav
+    python3 video/chapter-6-1/soundtrack.py      -> video/chapter-6-1/out/soundtrack.wav
 
-Reads out/events.json and out/timeline.json (from `VIDEO=matmul render.mjs`) and, if present, the
-spoken lines in out/narration/ (from `VIDEO=matmul narrate.py`). Same NumPy synthesizer as the
-trailer; the pulse speeds up through the optimizations and the music ducks under the voice.
+Reads out/events.json and out/timeline.json (from `VIDEO=chapter-6-1 render.mjs`) and, if present, the
+spoken lines in out/narration/ (from `VIDEO=chapter-6-1 narrate.py`). Same NumPy synthesizer as the
+trailer; the pulse speeds up through the chapter and the music ducks under the voice.
 """
 import importlib.util
 import json
@@ -25,10 +25,10 @@ SR = S.SR
 N = int(SR * DUR)
 S.DUR, S.N, S.t_all = DUR, N, np.arange(N) / SR
 S.SECTIONS = [
-    (SC['hook'], [45, 52], 0.55),                  # A, sparse: the slow kernel
-    (SC['coalesce'], [38, 45, 53, 60, 64], 0.85),  # Dm9
-    (SC['tile'], [41, 48, 57, 64], 0.9),           # Fmaj7
-    (SC['climb'], [43, 50, 59, 62, 67], 1.05),     # G: lift
+    (SC['hook'], [45, 52, 60], 0.6),               # Am, sparse: the 60× gap
+    (SC['code'], [38, 45, 53, 60, 64], 0.85),  # Dm9
+    (SC['figure'], [41, 48, 57, 64], 0.9),           # Fmaj7
+    (SC['measured'], [43, 50, 59, 62, 67], 1.05),  # G: lift
     (SC['cta'], [48, 55, 64, 67, 72], 1.1),        # C: resolve
 ]
 
@@ -59,7 +59,7 @@ def main():
         s = S.SHOTS[e['type']](e['p'])
         s = s[: min(N, i0 + len(s)) - i0]
         if e['type'] == 'key':
-            s = s * 0.6  # the naive kernel's cells: a quiet clatter, not a typewriter
+            s = s * 0.6  # quiet
         pan = S.PAN.get(e['type'], 0.0) * np.sin(e['p'] * 1.7 + e['t'])
         fx[0, i0:i0 + len(s)] += s * np.sqrt((1 - pan) / 2) * 1.414
         fx[1, i0:i0 + len(s)] += s * np.sqrt((1 + pan) / 2) * 1.414
@@ -67,11 +67,11 @@ def main():
     # a pulse that quickens as the kernel gets faster: 70 -> 120 bpm, then stops for the reveal
     beat = np.zeros(N)
     k = S.boom(0)[: int(0.5 * SR)] * S.env_exp(int(0.5 * SR), 0.12, 0.002) * 0.38
-    bt = SC['coalesce']
-    while bt < SC['climb'] - 0.3:
+    bt = SC['code']
+    while bt < SC['measured'] - 0.3:
         i0 = int(bt * SR)
         beat[i0:i0 + len(k)] += k[: N - i0]
-        frac = (bt - SC['coalesce']) / (SC['climb'] - SC['coalesce'])
+        frac = (bt - SC['code']) / (SC['measured'] - SC['code'])
         bt += 60 / (70 + 50 * frac)
     fx += beat
 

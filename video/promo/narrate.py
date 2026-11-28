@@ -6,7 +6,7 @@ Run it with the Python that has kokoro-onnx installed (see README). The lines an
 come from NARRATION in index.html, via `render.mjs --meta`. A line that would run into the next one
 is spoken a little faster (up to MAX_SPEED); if it still does not fit, the script says so and exits 1.
 
-Env: VIDEO (default promo: which folder under video/ to narrate, e.g. matmul),
+Env: VIDEO (default promo: which folder under video/ to narrate, e.g. chapter-6-1),
      KOKORO_DIR (default ~/.cache/kokoro-tts, holds kokoro-v1.0.onnx and voices-v1.0.bin),
      VOICE (default af_heart), SPEED (default 1.0).
 """
