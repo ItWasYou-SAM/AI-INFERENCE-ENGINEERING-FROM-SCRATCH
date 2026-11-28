@@ -136,6 +136,40 @@ const concepts = [
     </div>
   </div>
 
+  <!-- ─── Watch: chapter 6.1 in 22 seconds ────────────── -->
+  <section class="mx-auto mt-20 max-w-6xl px-5" aria-labelledby="watch-title">
+    <div class="reveal mb-8 grid gap-4 lg:grid-cols-[1fr_1fr] lg:items-end">
+      <div>
+        <p class="eyebrow">Watch · 22 seconds, sound on</p>
+        <h2 id="watch-title" class="mt-2 text-3xl sm:text-4xl">A chapter, <span class="italic text-blue">in 22 seconds</span></h2>
+      </div>
+      <p class="text-ink-soft">
+        Chapter 6.1, recorded on this site: the naive matmul kernel, the interactive tiling figure clicked live, and the
+        <b class="text-ink">measured</b> output from an RTX 3050 Laptop GPU. A naive kernel is 60× slower than cuBLAS; the chapter shows why,
+        and how to close the gap.
+      </p>
+    </div>
+    <figure class="reveal" style="--d:100ms">
+      <div class="overflow-hidden rounded-2xl border border-rule bg-[#0d1118] shadow-[0_24px_60px_-20px_rgba(0,0,0,0.45)]">
+        <video
+          class="block aspect-video w-full"
+          src="/video/chapter-6-1.mp4"
+          poster="/video/chapter-6-1-poster.jpg"
+          controls
+          playsinline
+          preload="none"
+          width="1920"
+          height="1080"
+          aria-describedby="watch-caption"
+        ></video>
+      </div>
+      <figcaption id="watch-caption" class="mt-3 flex flex-wrap items-center justify-between gap-3 font-mono text-[0.7rem] tracking-wide text-ink-faint uppercase">
+        <span>6.1 · naive → coalesced → shared-memory tiled matmul</span>
+        <a href="/learn/m06/tiled-matmul" class="ink-link text-ink">Open chapter 6.1 →</a>
+      </figcaption>
+    </figure>
+  </section>
+
   <!-- ─── Levels ───────────────────────────────────────── -->
   <section class="mx-auto mt-20 max-w-6xl px-5">
     <div class="reveal mb-8 flex items-end justify-between gap-6">

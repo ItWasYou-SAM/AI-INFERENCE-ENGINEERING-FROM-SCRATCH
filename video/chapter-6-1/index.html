@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Chapter 6.1 on the live site: a cinematic walk-through</title>
+<style>
+  @font-face { font-family: 'Fraunces'; src: url(../trailer/fonts/fraunces-latin-wght-normal.woff2) format('woff2'); font-weight: 100 900; font-style: normal; }
+  @font-face { font-family: 'Fraunces'; src: url(../trailer/fonts/fraunces-latin-wght-italic.woff2) format('woff2'); font-weight: 100 900; font-style: italic; }
+  @font-face { font-family: 'JBM'; src: url(../trailer/fonts/jetbrains-mono-latin-wght-normal.woff2) format('woff2'); font-weight: 100 800; }
+  @font-face { font-family: 'Serif4'; src: url(../trailer/fonts/source-serif-4-latin-wght-normal.woff2) format('woff2'); font-weight: 200 900; }
+  html, body { margin: 0; height: 100%; background: #07090d; overflow: hidden; }
+  body { display: grid; place-items: center; }
+  canvas { width: min(100vw, 177.78vh); height: auto; display: block; }
+  body.render canvas { width: 1920px; }
+</style>
+</head>
+<body>
+<canvas id="cv" width="1920" height="1080"></canvas>
+<script src="../promo/lib.js"></script>
+<script>
+/* Chapter 6.1 as it appears on the live site. Every page image in shots/ is a real capture of
+   https://ai-inference-engineering-from-scrat.vercel.app (capture.mjs): the figure states come from
+   clicking its real buttons. This file only adds the edit: camera moves, cursor, highlights, titles. */
+useCanvas(document.getElementById('cv'));
+const TL = { hook: 0, code: 4.4, figure: 8.6, measured: 14.6, cta: 18.4, end: 22.5 };
+const D = TL.end;
+const NARRATION = [
+  { t: 0.3, text: "A naive matrix multiply is sixty times slower than NVIDIA's best." },
+  { t: 4.6, text: 'Chapter 6.1 closes the gap, starting with memory access.' },
+  { t: 8.8, text: 'Then you try it yourself: tile the matrix, and watch the memory loads drop.' },
+  { t: 14.8, text: 'Every number is measured, on a laptop GPU.' },
+  { t: 18.6, text: 'Free and open source. Star it on GitHub.' },
+];
+const LABELS = [
+  [TL.hook, TL.code, '01', 'CHAPTER 6.1 · LIVE ON THE SITE'],
+  [TL.code, TL.figure, '02', 'VERSION 1 → 2 · THE CODE'],
+  [TL.figure, TL.measured, '03', 'THE INTERACTIVE FIGURE · CLICKED LIVE'],
+  [TL.measured, TL.cta, '04', 'MEASURED · RTX 3050 LAPTOP'],
+];
+const EVENTS = [];
+const ev = (t, type, p = 0) => EVENTS.push({ t: +t.toFixed(3), type, p });
+const S = [];
+const scene = (s, e, draw) => S.push({ s, e, draw });
+
+const SHOTS = ['title', 'naive', 'measured', 'fig-0', 'fig-untiled', 'fig-tiled', 'fig-k2', 'fig-k3', 'fig-k4', 'fig-8-k1', 'fig-8-k2'];
+const SH = {};
+for (const n of SHOTS) { const im = new Image(); im.src = `shots/${n}.jpg`; SH[n] = im; }
+const shotsReady = Promise.all(Object.values(SH).map((im) => new Promise((r) => { if (im.complete) r(); else { im.onload = r; im.onerror = r; } })));
+const META = fetch('shots/shots.json').then((r) => r.json());
+let M = null;
+
+// Camera: put CSS point (cx, cy) of a shot at screen (sx, sy), at zoom z (1 = the 1280 px page fills 1920 px).
+function cam(img, cx, cy, z, a = 1, sx = W / 2, sy = H / 2) {
+  if (!img?.naturalWidth) return null;
+  const s = 1.5 * z;
+  ctx.save(); ctx.globalAlpha *= a;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, sx - cx * s, sy - cy * s, (img.naturalWidth / 2) * s, (img.naturalHeight / 2) * s);
+  ctx.restore();
+  return (x, y) => [sx + (x - cx) * s, sy + (y - cy) * s];
+}
+// Highlighter swipe across a line of real text, in CSS px of that shot.
+function marker(to, x0, x1, y, h, p, col = C.amber) {
+  if (!to || p <= 0) return;
+  const [ax, ay] = to(x0, y - h / 2), [bx, by] = to(x1, y + h / 2);
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.fillStyle = rgba(col, 0.28);
+  ctx.fillRect(ax, ay, (bx - ax) * eio(p), by - ay);
+  ctx.restore();
+  ctx.save(); ctx.fillStyle = rgba(col, 0.9); ctx.fillRect(ax, by - 3, (bx - ax) * eio(p), 3); ctx.restore();
+}
+// highlight a phrase captured by capture.mjs (meta.marks, page px) inside a slice starting at page y0
+function mark(to, key, y0, p, col) {
+  if (!M) return;
+  const [x, y, w, h] = M.marks[key];
+  marker(to, x - 6, x + w + 6, y - y0 + h / 2, h + 8, p, col);
+}
+// chapter label, set like a subtitle in the bottom letterbox bar
+function kicker(num, str, lt) {
+  const a = eo(seg(lt, 0.15, 0.6)) * (1 - seg(lt, 3.4, 3.9));
+  const f = font(19, 600, 'm'), full = num + '   ' + str, x = (W - measure(full, f)) / 2;
+  T(num, x, H - 26, { f, c: C.amber, ls: 3, a });
+  T(str, x + measure(num + '   ', f), H - 26, { f, c: C.ink, ls: 3, a });
+}
+// how a scene's own camera eases between keyframes [[lt, cx, cy, z], ...]
+function track(lt, kf) {
+  let k = kf[0];
+  for (let i = 1; i < kf.length; i++) if (lt > kf[i - 1][0]) {
+    const q = eio(seg(lt, kf[i - 1][0], kf[i][0]));
+    k = [lt, lerp(kf[i - 1][1], kf[i][1], q), lerp(kf[i - 1][2], kf[i][2], q), lerp(kf[i - 1][3], kf[i][3], q)];
+  }
+  return k;
+}
+
+/* ── 1 · the chapter, on the live site ─────────────────────────────── */
+ev(0.25, 'boom'); ev(2.3, 'swish');
+scene(TL.hook, TL.code, (t, lt) => {
+  const [, cx, cy, z] = track(lt, [[0, 600, 235, 2.05], [2.0, 640, 300, 1.7], [4.4, 660, 400, 1.55]]);
+  const to = cam(SH.title, cx, cy, z);
+  mark(to, 'gap', 0, seg(lt, 2.3, 2.75));                          // "is 60×"
+});
+
+/* ── 2 · the code ───────────────────────────────────────────────────── */
+ev(TL.code - 0.3, 'whoosh'); ev(TL.code + 2.0, 'swish');
+scene(TL.code, TL.figure, (t, lt) => {
+  const [, cx, cy, z] = track(lt, [[0, 640, 250, 1.95], [1.6, 660, 330, 1.75], [4.2, 660, 520, 1.6]]);
+  const to = cam(SH.naive, cx, cy, z);
+  mark(to, 'loop', M?.naive.y0, seg(lt, 0.7, 1.2), C.red);        // the loop over k
+  mark(to, 'sectors', M?.naive.y0, seg(lt, 2.0, 2.5), C.red);     // 32 separate sectors ...
+});
+
+/* ── 3 · the figure, clicked for real ───────────────────────────────── */
+// [lt, shot shown from then on, button clicked to get there]
+const CLICKS = [[1.0, 'fig-untiled', 'untiled'], [2.3, 'fig-tiled', 'tiled'], [3.1, 'fig-k2', 'next'], [3.55, 'fig-k3', 'next'], [4.0, 'fig-k4', 'next'], [4.65, 'fig-8-k1', 't8'], [5.25, 'fig-8-k2', 'next']];
+CLICKS.forEach(([c], i) => ev(TL.figure + c, 'tick', i));
+ev(TL.figure - 0.3, 'whoosh');
+scene(TL.figure, TL.measured, (t, lt) => {
+  const [, cx, cy, z] = track(lt, [[0, 640, 360, 1.0], [0.8, 666, 392, 1.29], [3.0, 666, 392, 1.31], [6.0, 666, 394, 1.33]]);
+  let cur = 'fig-0', prev = null, since = 99;
+  for (const [c, shot] of CLICKS) if (lt >= c) { prev = cur; cur = shot; since = lt - c; }
+  const to = cam(SH[cur], cx, cy, z);
+  if (prev && since < 0.12) cam(SH[prev], cx, cy, z, 1 - since / 0.12);     // a 4-frame dissolve: the page re-rendering
+  // cursor glides between the real buttons, presses on each click
+  if (to && M) {
+    let pos = [760, 520], press = 0;
+    for (let i = 0; i < CLICKS.length; i++) {
+      const [c, , b] = CLICKS[i], from = i ? M.buttons[CLICKS[i - 1][2]] : [760, 520], target = M.buttons[b];
+      const lead = Math.min(0.6, c - (i ? CLICKS[i - 1][0] : 0.2) - 0.1);
+      if (lt >= c - lead) {
+        const g = eio(seg(lt, c - lead, c - 0.06));
+        pos = [lerp(from[0], target[0], g), lerp(from[1], target[1], g)];
+        const pr = seg(lt, c - 0.03, c + 0.35);
+        press = pr > 0 && pr < 1 ? pr : 0;
+      }
+    }
+    const [px, py] = to(pos[0], pos[1]);
+    cursor(px, py, press, eo(seg(lt, 0.3, 0.7)) * (1 - seg(lt, 5.6, 5.9)));
+  }
+});
+
+/* ── 4 · measured ───────────────────────────────────────────────────── */
+ev(TL.measured - 0.3, 'whoosh'); ev(TL.measured + 1.0, 'swish'); ev(TL.measured + 1.9, 'chime');
+scene(TL.measured, TL.cta, (t, lt) => {
+  const [, cx, cy, z] = track(lt, [[0, 670, 260, 1.6], [1.6, 670, 300, 1.78], [3.8, 670, 320, 1.86]]);
+  const to = cam(SH.measured, cx, cy, z);
+  mark(to, 'naive', M?.measured.y0, seg(lt, 1.0, 1.5), C.red);     // naive 1821 ms
+  mark(to, 'cublas', M?.measured.y0, seg(lt, 1.9, 2.4), C.green);  // cuBLAS 30.55 ms
+});
+
+/* ── 5 · call to action: the cursor stars the repo from the chapter's own header ── */
+ev(TL.cta - 0.3, 'whoosh'); ev(TL.cta + 1.35, 'tick', 4); ev(TL.cta + 1.8, 'boom'); ev(TL.cta + 2.6, 'chime');
+scene(TL.cta, D, (t, lt) => {
+  const [, cx, cy, z] = track(lt, [[0, 666, 394, 1.33], [1.4, 1010, 150, 1.6], [4.1, 1010, 170, 1.5]]);
+  const d = eio(seg(lt, 1.8, 2.5));
+  if (d > 0) ctx.filter = `blur(${(10 * d).toFixed(1)}px)`;
+  const to = cam(SH['fig-8-k2'], cx, cy, z);
+  ctx.filter = 'none';
+  if (to && M) {
+    const g = eio(seg(lt, 0.3, 1.3));
+    const [px, py] = to(lerp(M.buttons.next[0], M.star[0], g), lerp(M.buttons.next[1], M.star[1], g));
+    const pr = seg(lt, 1.32, 1.7);
+    cursor(px, py, pr > 0 && pr < 1 ? pr : 0, eo(seg(lt, 0.1, 0.4)) * (1 - seg(lt, 1.9, 2.2)));
+  }
+  if (d > 0) {
+    ctx.fillStyle = `rgba(7,9,13,${0.8 * d})`; ctx.fillRect(0, 0, W, H);
+    titleLockup(W / 2, 450 + (1 - d) * 20, 88, d);
+    T('Chapter 6.1 and 108 more. Interactive, measured, free.', W / 2, 535, { f: font(34, 400, 's'), c: C.soft, align: 'center', a: eo(seg(lt, 2.2, 2.7)) });
+    const ga = eo(seg(lt, 2.4, 2.9));
+    const uf = font(28, 500, 'm'), uw = measure(URL_GH, uf) + 120;
+    ctx.save(); ctx.globalAlpha *= ga;
+    rr((W - uw) / 2, 610, uw, 80, 40, rgba(C.amber, 0.1), rgba(C.amber, 0.7), 2);
+    T('★', (W - uw) / 2 + 40, 661, { f: font(30, 500, 'm'), c: C.amber });
+    T(URL_GH, (W - uw) / 2 + 84, 660, { f: uf });
+    ctx.restore();
+    T('Star it on GitHub →', W / 2, 790, { f: font(36, 460, 'd', true), align: 'center', a: eo(seg(lt, 2.8, 3.3)) });
+  }
+});
+
+/* ── frame ────────────────────────────────────────────────────────── */
+function draw(t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#0d1118'; ctx.fillRect(0, 0, W, H);
+  for (const sc of S) {
+    if (t < sc.s - 0.001 || t > sc.e + 0.35) continue;
+    const lt = t - sc.s;
+    ctx.save();
+    // each shot dissolves into the next over 0.35 s
+    ctx.globalAlpha = t > sc.e ? 1 - eio(seg(t, sc.e, sc.e + 0.35)) : 1;
+    sc.draw(t, lt);
+    ctx.restore();
+  }
+  finishFrame(t, 0.5);
+  const bar = 64 * (1 - eio(seg(t, TL.cta + 1.6, TL.cta + 2.4)));
+  if (bar > 0.5) { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, bar); ctx.fillRect(0, H - bar, W, bar); }
+  for (const [s0, e0, num, str] of LABELS) if (t >= s0 && t < e0) kicker(num, str, t - s0);
+  const blk = Math.max(1 - seg(t, 0, 0.5), seg(t, D - 0.8, D - 0.1));
+  if (blk > 0) { ctx.fillStyle = `rgba(0,0,0,${blk})`; ctx.fillRect(0, 0, W, H); }
+}
+
+window.DURATION = D;
+window.EVENTS = EVENTS.sort((a, b) => a.t - b.t);
+window.TIMELINE = { duration: D, scenes: TL, narration: NARRATION };
+window.draw = draw;
+window.ready = Promise.all([fontsReady, shotsReady, META.then((m) => { M = m; })]);
+
+const params = new URLSearchParams(location.search);
+if (params.has('render')) document.body.classList.add('render');
+else {
+  let t0 = performance.now() - (parseFloat(params.get('t')) || 0) * 1000;
+  document.getElementById('cv').addEventListener('click', () => { t0 = performance.now(); });
+  window.ready.then(() => { const loop = (now) => { draw(((now - t0) / 1000) % D); requestAnimationFrame(loop); }; requestAnimationFrame(loop); });
+}
+</script>
+</body>
+</html>
