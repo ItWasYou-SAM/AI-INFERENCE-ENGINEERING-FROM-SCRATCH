@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Inference Engineering, from Scratch: 57× faster matmul</title>
+<style>
+  @font-face { font-family: 'Fraunces'; src: url(../trailer/fonts/fraunces-latin-wght-normal.woff2) format('woff2'); font-weight: 100 900; font-style: normal; }
+  @font-face { font-family: 'Fraunces'; src: url(../trailer/fonts/fraunces-latin-wght-italic.woff2) format('woff2'); font-weight: 100 900; font-style: italic; }
+  @font-face { font-family: 'JBM'; src: url(../trailer/fonts/jetbrains-mono-latin-wght-normal.woff2) format('woff2'); font-weight: 100 800; }
+  @font-face { font-family: 'Serif4'; src: url(../trailer/fonts/source-serif-4-latin-wght-normal.woff2) format('woff2'); font-weight: 200 900; }
+  html, body { margin: 0; height: 100%; background: #07090d; overflow: hidden; }
+  body { display: grid; place-items: center; }
+  canvas { width: min(100vw, 177.78vh); height: auto; display: block; }
+  body.render canvas { width: 1920px; }
+</style>
+</head>
+<body>
+<canvas id="cv" width="1920" height="1080"></canvas>
+<script src="../promo/lib.js"></script>
+<script>
+/* A 22-second cut about one chapter arc: chapters 6.1 and 6.2, the same 4096³ FP32 matmul
+   written five ways on an RTX 3050 Laptop GPU. Every number on screen is measured output
+   printed in those chapters (labs/m06/6.1 and 6.2). */
+useCanvas(document.getElementById('cv'));
+// Scene start times (seconds). The narrator, music and sound effects all key off these.
+const TL = { hook: 0, coalesce: 4.4, tile: 8.8, climb: 13.4, cta: 18.0, end: 22.5 };
+const D = TL.end;
+const NARRATION = [
+  { t: 0.25, text: 'On a laptop GPU, a naive matrix multiply takes two seconds.' },
+  { t: 4.6, text: 'Change one index, and the memory reads coalesce. Seven times faster.' },
+  { t: 9.0, text: 'Stage tiles in shared memory, then registers. Reuse every load.' },
+  { t: 13.6, text: "Fifty-seven times faster. Ninety-four percent of NVIDIA's own library." },
+  { t: 18.2, text: 'Write every kernel yourself. Free and open source, on GitHub.' },
+];
+// measured (6.1 and 6.2 output, RTX 3050 6GB Laptop, 4096 x 4096 FP32)
+const K = [
+  ['naive', 75, '6.1'], ['coalesced', 535, '6.1'], ['shared-memory tiles', 674, '6.1'],
+  ['1D register tiles', 2016, '6.2'], ['2D register tiles', 2973, '6.2'], ['2D + float4 loads', 4290, '6.2'],
+];
+const CUBLAS = 4554;
+
+const EVENTS = [];
+const ev = (t, type, p = 0) => EVENTS.push({ t: +t.toFixed(3), type, p });
+const S = [];
+const scene = (s, e, draw) => S.push({ s, e, draw });
+const fmt = (v) => Math.round(v).toLocaleString('en-US');
+
+function headline(str, lt, o = {}) {
+  const size = o.size || 60, y = o.y || 200, start = o.start ?? 0.2;
+  const parts = str.split(' ').map((w) => { const em = w.startsWith('*'); const tx = w.replace(/\*/g, ''); return { tx, em, f: font(size, em ? 500 : 480, 'd', em) }; });
+  const sp = measure(' ', font(size));
+  const total = parts.reduce((s, p) => s + measure(p.tx, p.f), 0) + sp * (parts.length - 1);
+  let x = o.align === 'center' ? (W - total) / 2 : o.x ?? 160;
+  parts.forEach((p, i) => {
+    const q = eo(seg(lt, start + i * 0.05, start + i * 0.05 + 0.45));
+    T(p.tx, x, y + (1 - q) * 24, { f: p.f, c: p.em ? (o.em || C.amber) : C.ink, a: q });
+    x += measure(p.tx, p.f) + sp;
+  });
+}
+function tag(str, lt, y = 250, col = C.amber) {
+  const a = eo(seg(lt, 0.05, 0.5));
+  T(str, 160, y, { f: font(22, 600, 'm'), c: col, ls: 3, a });
+  line(160, y + 16, 160 + 64 * a, y + 16, rgba(col, 0.7 * a), 2);
+}
+// the big number on the left: value tweened through keyframes [[lt, value], ...]
+function counter(lt, kf, y, o = {}) {
+  let v = kf[0][1];
+  for (let i = 1; i < kf.length; i++) if (lt > kf[i - 1][0]) v = lerp(kf[i - 1][1], kf[i][1], eio(seg(lt, kf[i - 1][0], kf[i][0])));
+  const a = eo(seg(lt, o.in ?? 0.3, (o.in ?? 0.3) + 0.5));
+  const col = o.col || C.ink;
+  T(o.label || 'GFLOP/s', 164, y - 112, { f: font(22, 500, 'm'), c: C.faint, ls: 4, a });
+  T(fmt(v), 156, y, { f: font(124, 520, 'm'), c: col, a, glow: rgba(col, 0.35), blur: 30 });
+  return v;
+}
+function badge(str, sub, x, y, col, a) {
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  const f = font(46, 560), w = Math.max(measure(str, f), measure(sub, font(22, 400, 's'))) + 56;
+  rr(x, y - (1 - a) * 14, w, 104, 18, rgba(col, 0.12), rgba(col, 0.85), 2);
+  T(str, x + 28, y + 52 - (1 - a) * 14, { f, c: col });
+  T(sub, x + 28, y + 86 - (1 - a) * 14, { f: font(22, 400, 's'), c: C.soft });
+  ctx.restore();
+}
+
+/* ── the stage: A (left), B (top), C (bottom right), on screen from 0 to the chart ── */
+const N = 16, CS = 22, SZ = N * CS, GAP = 26, TILE = 4;
+const CX = 1340, CY = 600;
+const M = { A: [CX - SZ - GAP, CY], B: [CX, CY - SZ - GAP], C: [CX, CY] };
+const cellXY = (m, i, j) => [M[m][0] + j * CS, M[m][1] + i * CS];
+function cell(m, i, j, col, a = 1, glow = 0) {
+  const [x, y] = cellXY(m, i, j);
+  ctx.save(); ctx.globalAlpha *= a;
+  if (glow) { ctx.shadowColor = rgba(col, 0.8); ctx.shadowBlur = 18 * glow; }
+  ctx.fillStyle = col; ctx.fillRect(x + 2, y + 2, CS - 4, CS - 4);
+  ctx.restore();
+}
+function tileBox(m, ti, tj, col, a = 1, fill = 0) {
+  const [x, y] = cellXY(m, ti * TILE, tj * TILE), s = TILE * CS;
+  ctx.save(); ctx.globalAlpha *= a;
+  rr(x, y, s, s, 4, fill ? rgba(col, fill) : null, col, 2.5);
+  ctx.restore();
+}
+// which cells of C the naive kernel has finished, in the hook
+const naiveDone = (lt) => Math.floor(N * N * 0.2 * eo(seg(lt, 0.9, 4.4)));
+for (let c = 1; c < N * N * 0.2; c += 3) ev(TL.hook + 0.9 + 3.5 * (1 - Math.cbrt(1 - c / (N * N * 0.2))), 'key', c);
+
+function stage(t) {
+  const vis = 1 - eio(seg(t, TL.climb - 0.5, TL.climb + 0.1));
+  if (vis <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = vis;
+  // slow push-in on C, like a camera dolly
+  const z = 1 + 0.06 * eio(seg(t, 0, TL.climb));
+  ctx.translate(CX, CY); ctx.scale(z, z); ctx.translate(-CX, -CY);
+  // matrices assemble on a diagonal wave
+  for (const m of ['A', 'B', 'C']) {
+    for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+      const d = (m === 'A' ? 0 : m === 'B' ? 0.25 : 0.5) + (i + j) * 0.018;
+      const a = eo(seg(t, 0.15 + d, 0.6 + d));
+      if (a > 0) cell(m, i, j, m === 'C' ? '#1c232f' : C.paper3, a);
+    }
+  }
+  const la = eo(seg(t, 0.8, 1.4));
+  T('A', M.A[0] - 20, M.A[1] + SZ / 2 + 14, { f: font(40, 500, 'd', true), c: C.blue, align: 'right', a: la });
+  T('B', M.B[0] + SZ / 2, M.B[1] - 18, { f: font(40, 500, 'd', true), c: C.teal, align: 'center', a: la });
+  T('C = A · B', M.C[0] + SZ / 2, M.C[1] + SZ + 46, { f: font(30, 500, 'd', true), c: C.amber, align: 'center', a: la });
+  T('4096 × 4096 · FP32', M.C[0] + SZ / 2, M.C[1] + SZ + 82, { f: font(18, 500, 'm'), c: C.faint, align: 'center', ls: 2, a: la });
+
+  // hook: one output at a time, each a full row × column dot product
+  if (t < TL.coalesce + 0.5) {
+    const lt = t - TL.hook, fade = 1 - seg(t, TL.coalesce - 0.2, TL.coalesce + 0.3);
+    const done = naiveDone(lt);
+    for (let c = 0; c < done; c++) cell('C', Math.floor(c / N), c % N, rgba(C.amber, 0.55), fade);
+    if (lt > 0.9) {
+      const ci = Math.floor(done / N), cj = done % N, k = Math.floor((lt * 36) % N);
+      for (let q = 0; q < N; q++) { cell('A', ci, q, rgba(C.blue, 0.35), fade); cell('B', q, cj, rgba(C.teal, 0.35), fade); }
+      cell('A', ci, k, C.blue, fade, 1); cell('B', k, cj, C.teal, fade, 1);
+      cell('C', ci, cj, C.amber, fade * (0.6 + 0.4 * Math.sin(lt * 20)), 1);
+    }
+  }
+  // coalescing: which cells one warp touches
+  if (t > TL.coalesce - 0.2 && t < TL.tile + 0.3) {
+    const lt = t - TL.coalesce, k = Math.floor((lt * 7) % N);
+    const fade = eo(seg(lt, 0, 0.4)) * (1 - seg(t, TL.tile - 0.3, TL.tile + 0.2));
+    const p1 = fade * (1 - seg(lt, 2.0, 2.3)), p2 = fade * seg(lt, 2.2, 2.5);
+    if (p1 > 0) for (let i = 0; i < N; i++) { cell('C', i, 5, rgba(C.red, 0.7), p1); cell('A', i, k, C.red, p1, 0.8); }
+    if (p2 > 0) {
+      for (let j = 0; j < N; j++) { cell('C', 5, j, rgba(C.green, 0.7), p2); cell('B', k, j, C.green, p2, 0.8); }
+      cell('A', 5, k, C.amber, p2, 1);
+    }
+    const lab = (s, c, a) => T(s, M.C[0] + SZ / 2, M.B[1] - 64, { f: font(22, 500, 'm'), c, align: 'center', a, ls: 1 });
+    lab('a warp = a column of C', C.red, p1);
+    lab('a warp = a row of C', C.green, p2);
+  }
+  // tiling: a block of C walks along k, one tile of A and B at a time
+  if (t > TL.tile - 0.2) {
+    const lt = t - TL.tile, gridA = eo(seg(lt, 0, 0.5));
+    for (const m of ['A', 'B', 'C']) for (let ti = 0; ti < N / TILE; ti++) for (let tj = 0; tj < N / TILE; tj++) tileBox(m, ti, tj, rgba(C.ink, 0.12), gridA);
+    const steps = 4, p = Math.min(steps - 1, Math.floor(seg(lt, 0.5, 2.9) * steps));
+    const ph = (seg(lt, 0.5, 2.9) * steps) % 1;
+    const regs = seg(lt, 2.9, 3.3);
+    // the C tile accumulates
+    for (let i = 0; i < TILE; i++) for (let j = 0; j < TILE; j++) {
+      const acc = Math.min(1, (seg(lt, 0.5, 2.9) * steps) / steps);
+      cell('C', TILE + i, 2 * TILE + j, C.amber, gridA * (0.2 + 0.6 * acc), acc);
+    }
+    tileBox('C', 1, 2, C.amber, gridA);
+    if (regs < 1) {
+      tileBox('A', 1, p, C.blue, gridA * (1 - regs), 0.35);
+      tileBox('B', p, 2, C.teal, gridA * (1 - regs), 0.35);
+      // copies fly into shared memory (the empty quadrant above A)
+      const fly = eio(clamp(ph * 2.2)), s = TILE * CS;
+      const [ax, ay] = cellXY('A', TILE, p * TILE), [bx, by] = cellXY('B', p * TILE, 2 * TILE);
+      const smx = M.A[0] + 40, smy = M.B[1] + 120;
+      ctx.save(); ctx.globalAlpha *= gridA * (1 - regs);
+      rr(smx - 22, smy - 64, 2 * s * 1.3 + 88, s * 1.3 + 106, 14, rgba(C.violet, 0.07), rgba(C.violet, 0.6), 2);
+      T('SHARED MEMORY', smx - 4, smy - 26, { f: font(18, 600, 'm'), c: C.violet, ls: 3 });
+      const sc = lerp(1, 1.3, fly);
+      rr(lerp(ax, smx, fly), lerp(ay, smy, fly), s * sc, s * sc, 6, rgba(C.blue, 0.55), C.blue, 2);
+      rr(lerp(bx, smx + s * 1.3 + 44, fly), lerp(by, smy, fly), s * sc, s * sc, 6, rgba(C.teal, 0.55), C.teal, 2);
+      ctx.restore();
+    }
+    // registers: each thread owns a small block of outputs
+    if (regs > 0) {
+      const [x, y] = cellXY('C', TILE, 2 * TILE), s = TILE * CS;
+      const pulse = 0.5 + 0.5 * Math.sin(lt * 9);
+      ctx.save(); ctx.globalAlpha *= regs;
+      for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++) {
+        rr(x + b * s / 2 + 3, y + a * s / 2 + 3, s / 2 - 6, s / 2 - 6, 4, rgba(C.green, 0.18 + 0.2 * pulse * ((a + b) % 2 ? 1 : 0.6)), C.green, 2);
+      }
+      ctx.restore();
+      const qa = eo(seg(lt, 3.0, 3.5));
+      T('REGISTERS', M.A[0] + 40, M.B[1] + 140, { f: font(18, 600, 'm'), c: C.green, ls: 3, a: qa });
+      T('8 × 8 outputs per thread', M.A[0] + 40, M.B[1] + 190, { f: font(26, 500), a: qa });
+      T('16 loads feed 64 FMAs', M.A[0] + 40, M.B[1] + 232, { f: font(26, 400, 's'), c: C.soft, a: eo(seg(lt, 3.2, 3.7)) });
+    }
+  }
+  ctx.restore();
+}
+
+/* DRAM strip: global memory as 16 rows laid end to end; shows which bytes one warp load touches */
+function dram(lt, p1, p2, k) {
+  const x0 = 160, y0 = 862, w = 720, h = 40, g = 4, sw = (w - (N - 1) * g) / N;
+  const a = Math.max(p1, p2);
+  if (a <= 0) return;
+  T('GLOBAL MEMORY, ROW AFTER ROW', x0, y0 - 18, { f: font(17, 600, 'm'), c: C.faint, ls: 3, a });
+  for (let r = 0; r < N; r++) {
+    const x = x0 + r * (sw + g);
+    ctx.save(); ctx.globalAlpha *= a; rr(x, y0, sw, h, 4, '#1a212c', 'rgba(255,255,255,0.06)', 1); ctx.restore();
+    if (p1 > 0) { ctx.save(); ctx.globalAlpha *= p1; ctx.shadowColor = C.red; ctx.shadowBlur = 14; ctx.fillStyle = C.red; ctx.fillRect(x + (k / N) * sw, y0 + 4, Math.max(3, sw / N), h - 8); ctx.restore(); }
+  }
+  if (p2 > 0) { const x = x0 + k * (sw + g); ctx.save(); ctx.globalAlpha *= p2; ctx.shadowColor = C.green; ctx.shadowBlur = 20; rr(x, y0, sw, h, 4, C.green); ctx.restore(); }
+  T('32 sectors for 128 useful bytes', x0, y0 + h + 40, { f: font(26, 500, 'm'), c: C.red, a: p1 });
+  T('one 128-byte load, broadcast A', x0, y0 + h + 40, { f: font(26, 500, 'm'), c: C.green, a: p2 });
+}
+
+/* ── 1 · hook ─────────────────────────────────────────────────────── */
+ev(0.35, 'boom');
+scene(TL.hook, TL.coalesce, (t, lt) => {
+  tag('CHAPTERS 6.1 → 6.2 · ONE MATMUL, FIVE KERNELS', lt, 236);
+  headline('One matmul.', lt, { y: 340, size: 84, start: 0.3 });
+  headline('*137* *billion* *FLOPs.*', lt, { y: 436, size: 84, start: 0.55 });
+  const ms = 1821.42 * eo(seg(lt, 0.9, 4.4));
+  const a = eo(seg(lt, 0.9, 1.4));
+  T('NAIVE KERNEL · TIME', 164, 590, { f: font(22, 500, 'm'), c: C.faint, ls: 4, a });
+  T(`${fmt(ms)} ms`, 156, 714, { f: font(124, 520, 'm'), c: C.red, a, glow: rgba(C.red, 0.35), blur: 30 });
+  T('75 GFLOP/s · 1.7% of cuBLAS', 164, 776, { f: font(28, 400, 's'), c: C.soft, a: eo(seg(lt, 2.6, 3.1)) });
+  T('RTX 3050 6GB Laptop GPU', 164, 820, { f: font(20, 500, 'm'), c: C.faint, ls: 2, a: eo(seg(lt, 2.9, 3.4)) });
+});
+
+/* ── 2 · coalescing ───────────────────────────────────────────────── */
+ev(TL.coalesce - 0.3, 'whoosh'); ev(TL.coalesce + 2.25, 'swish'); ev(TL.coalesce + 3.4, 'chime');
+scene(TL.coalesce, TL.tile, (t, lt) => {
+  tag('VERSION 2 · COALESCED ACCESS', lt);
+  headline('Swap *one* *index.*', lt, { y: 340, size: 84 });
+  counter(lt, [[0, 75], [2.4, 75], [3.4, 535]], 560, { col: lt > 2.6 ? C.green : C.red });
+  badge('7.1× faster', 'one changed line of CUDA', 560, 448, C.green, eo(seg(lt, 3.3, 3.8)));
+  const k = Math.floor((lt * 7) % N);
+  const p1 = eo(seg(lt, 0.3, 0.7)) * (1 - seg(lt, 2.0, 2.3)), p2 = seg(lt, 2.2, 2.5);
+  dram(lt, p1, p2, k);
+  T('threads walk down rows', 164, 650, { f: font(30, 400, 's'), c: C.soft, a: p1 });
+  T('threads share one row', 164, 650, { f: font(30, 400, 's'), c: C.soft, a: p2 });
+});
+
+/* ── 3 · tiles: shared memory, then registers ─────────────────────── */
+ev(TL.tile - 0.3, 'whoosh');
+for (let p = 0; p < 4; p++) ev(TL.tile + 0.5 + p * 0.6, 'tick', p);
+ev(TL.tile + 2.95, 'swish'); ev(TL.tile + 3.5, 'blip', 3); ev(TL.tile + 4.1, 'blip', 5);
+scene(TL.tile, TL.climb, (t, lt) => {
+  tag('VERSIONS 3–5 · TILING', lt);
+  headline('Load once.', lt, { y: 340, size: 84 });
+  headline('*Reuse* *it.*', lt, { y: 436, size: 84, start: 0.4 });
+  const v = counter(lt, [[0, 535], [1.2, 535], [2.2, 674], [3.2, 674], [3.6, 2016], [4.2, 2973]], 712, { col: lt > 3.2 ? C.green : C.ink, in: 0.1 });
+  T(lt < 3.1 ? 'each value from memory is used 32×' : 'outer products in registers', 164, 780,
+    { f: font(30, 400, 's'), c: C.soft, a: eo(seg(lt, 0.6, 1.1)) });
+  T(v > 2500 ? '65% of cuBLAS' : v > 1000 ? '44% of cuBLAS' : '15% of cuBLAS', 164, 830, { f: font(22, 500, 'm'), c: C.faint, ls: 2, a: eo(seg(lt, 1.2, 1.7)) });
+});
+
+/* ── 4 · the climb ────────────────────────────────────────────────── */
+ev(TL.climb - 0.25, 'whoosh'); ev(TL.climb + 0.1, 'boom');
+K.forEach((_, i) => ev(TL.climb + 0.6 + i * 0.32, 'tick', i));
+ev(TL.climb + 2.9, 'chime');
+scene(TL.climb, TL.cta, (t, lt) => {
+  headline('Same math. Same laptop.', lt, { y: 168, size: 60 });
+  const bx = 640, bw = 1000, y0 = 250, rowH = 88, bh = 52;
+  const sx = (v) => bx + (v / CUBLAS) * bw;
+  // cuBLAS line
+  const la = eo(seg(lt, 0.3, 0.8));
+  ctx.save(); ctx.globalAlpha *= la; ctx.setLineDash([8, 8]);
+  line(sx(CUBLAS), y0 - 20, sx(CUBLAS), y0 + K.length * rowH + 6, rgba(C.ink, 0.5), 2);
+  ctx.restore();
+  T(`cuBLAS · ${fmt(CUBLAS)}`, sx(CUBLAS), y0 - 34, { f: font(20, 600, 'm'), c: C.ink, align: 'center', a: la, ls: 1 });
+  K.forEach(([name, v, ch], i) => {
+    const s = 0.6 + i * 0.32, g = eo(seg(lt, s, s + 0.9)), a = eo(seg(lt, s - 0.2, s + 0.2));
+    const y = y0 + i * rowH, last = i === K.length - 1;
+    const col = last ? C.amber : [C.red, C.blue, C.blue, C.teal, C.teal][i];
+    T(name, bx - 34, y + bh / 2 + 9, { f: font(26, 500, 'm'), c: last ? C.ink : C.soft, align: 'right', a });
+    T(ch, 160, y + bh / 2 + 9, { f: font(18, 500, 'm'), c: C.faint, a, ls: 2 });
+    ctx.save(); ctx.globalAlpha *= a;
+    if (last) { ctx.shadowColor = rgba(C.amber, 0.7); ctx.shadowBlur = 30; }
+    rr(bx, y, Math.max(6, (sx(v) - bx) * g), bh, 8, rgba(col, last ? 0.9 : 0.55));
+    ctx.restore();
+    if (last) T(fmt(v * g), Math.max(bx + 120, sx(v * g) - 18), y + bh / 2 + 10, { f: font(28, 700, 'm'), c: '#1a1408', align: 'right', a });
+    else T(fmt(v * g), Math.max(bx + 14, sx(v * g) + 16), y + bh / 2 + 10, { f: font(26, 600, 'm'), c: C.ink, a });
+  });
+  T('GFLOP/s', bx, y0 + K.length * rowH + 30, { f: font(18, 500, 'm'), c: C.faint, ls: 3, a: la });
+  const b = eo(seg(lt, 2.8, 3.3));
+  if (b > 0) {
+    ctx.save(); ctx.globalAlpha *= b;
+    const y = 862 + (1 - b) * 20;
+    T('57×', 160, y + 108, { f: font(150, 560), c: C.amber, glow: rgba(C.amber, 0.5), blur: 40 });
+    T('faster than naive', 470, y + 52, { f: font(36, 500) });
+    T('1,821 ms → 32 ms · 94% of cuBLAS', 470, y + 100, { f: font(28, 400, 'm'), c: C.soft });
+    ctx.restore();
+  }
+});
+
+/* ── 5 · call to action ───────────────────────────────────────────── */
+ev(TL.cta - 0.2, 'whoosh'); ev(TL.cta + 0.3, 'boom'); ev(TL.cta + 1.6, 'chime');
+scene(TL.cta, D, (t, lt) => {
+  const r = mulberry(21);
+  for (let i = 0; i < 60; i++) {
+    const x = r() * W, y = (r() * H - lt * (10 + r() * 16)) % H, s = 1 + r() * 2;
+    ctx.fillStyle = rgba(C.amber, 0.1 + 0.2 * r()); ctx.fillRect(x, (y + H) % H, s, s);
+  }
+  const la = eo(seg(lt, 0.1, 0.7));
+  if (logo.complete) {
+    ctx.save(); ctx.globalAlpha = la;
+    ctx.shadowColor = rgba(C.amber, 0.45); ctx.shadowBlur = 40;
+    ctx.beginPath(); ctx.arc(W / 2, 236, 62, 0, 7); ctx.fillStyle = C.site; ctx.fill();
+    ctx.shadowColor = 'transparent'; ctx.drawImage(logo, W / 2 - 50, 186, 100, 100); ctx.restore();
+  }
+  const ta = eo(seg(lt, 0.25, 1.0));
+  titleLockup(W / 2, 420 + (1 - ta) * 20, 92, ta);
+  T('Write every kernel yourself, then measure it. Free and open source.', W / 2, 505, { f: font(36, 400, 's'), c: C.soft, align: 'center', a: eo(seg(lt, 0.7, 1.2)) });
+  const ga = eo(seg(lt, 1.1, 1.6));
+  const uf = font(30, 500, 'm'), uw = measure(URL_GH, uf) + 120;
+  ctx.save(); ctx.globalAlpha = ga;
+  rr((W - uw) / 2, 590, uw, 84, 42, rgba(C.amber, 0.1), rgba(C.amber, 0.7), 2);
+  T('★', (W - uw) / 2 + 40, 644, { f: font(32, 500, 'm'), c: C.amber });
+  T(URL_GH, (W - uw) / 2 + 84, 643, { f: uf });
+  ctx.restore();
+  T('Star it, then start with Chapter 0.1, or jump to 6.1 →', W / 2, 780, { f: font(36, 460, 'd', true), align: 'center', a: eo(seg(lt, 1.7, 2.3)) });
+  T('109 chapters · interactive figures · real GPU labs', W / 2, 840, { f: font(22, 500, 'm'), c: C.faint, align: 'center', ls: 2, a: eo(seg(lt, 2.1, 2.6)) });
+});
+
+/* ── frame ────────────────────────────────────────────────────────── */
+function draw(t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  background(t, 0.45 + 0.55 * seg(t, 0.2, 2.0));
+  stage(t);
+  for (const sc of S) {
+    if (t < sc.s || t > sc.e) continue;
+    const lt = t - sc.s;
+    const fade = Math.min(eo(seg(lt, 0, 0.4)), 1 - eio(seg(t, sc.e - 0.4, sc.e)));
+    ctx.save();
+    ctx.globalAlpha = sc.e === D ? Math.min(1, eo(seg(lt, 0, 0.4))) : fade;
+    sc.draw(t, lt);
+    ctx.restore();
+  }
+  finishFrame(t);
+  // letterbox for the opening, a flash on the chart's arrival, fade from and to black
+  const bar = 110 * (1 - eio(seg(t, 3.9, 5.0)));
+  if (bar > 0.5) { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, bar); ctx.fillRect(0, H - bar, W, bar); }
+  const fl = 1 - seg(t, TL.climb + 0.05, TL.climb + 0.6);
+  if (fl < 1 && t > TL.climb) { ctx.fillStyle = rgba(C.amber, 0.12 * fl); ctx.fillRect(0, 0, W, H); }
+  const blk = Math.max(1 - seg(t, 0, 0.5), seg(t, D - 0.9, D - 0.1));
+  if (blk > 0) { ctx.fillStyle = `rgba(0,0,0,${blk})`; ctx.fillRect(0, 0, W, H); }
+}
+
+window.DURATION = D;
+window.EVENTS = EVENTS.sort((a, b) => a.t - b.t);
+window.TIMELINE = { duration: D, scenes: TL, narration: NARRATION };
+window.draw = draw;
+window.ready = Promise.all([fontsReady, imagesReady]);
+
+const params = new URLSearchParams(location.search);
+if (params.has('render')) document.body.classList.add('render');
+else {
+  let t0 = performance.now() - (parseFloat(params.get('t')) || 0) * 1000;
+  document.getElementById('cv').addEventListener('click', () => { t0 = performance.now(); });
+  window.ready.then(() => { const loop = (now) => { draw(((now - t0) / 1000) % D); requestAnimationFrame(loop); }; requestAnimationFrame(loop); });
+}
+</script>
+</body>
+</html>

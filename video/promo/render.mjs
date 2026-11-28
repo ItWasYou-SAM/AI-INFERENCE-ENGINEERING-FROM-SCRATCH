@@ -8,6 +8,7 @@
 //
 // Needs Chromium (CHROME=/usr/bin/chromium by default) and ffmpeg on PATH.
 // Serves the whole video/ folder, so the promo can share the trailer's fonts and logo.
+// VIDEO=matmul renders video/matmul/index.html instead (same --stills / --meta flags, output in video/matmul/out/).
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { writeFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs';
@@ -15,8 +16,9 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const root = path.dirname(here);
+const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const VIDEO = process.env.VIDEO || 'promo';
+const here = path.join(root, VIDEO);
 const require = createRequire(path.join(process.env.PPTR_HOME || process.cwd(), 'noop.js'));
 const puppeteer = require('puppeteer-core');
 
@@ -36,7 +38,7 @@ const server = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': MIME[path.extname(f)] || 'application/octet-stream' }).end(readFileSync(f));
 }).listen(0, '127.0.0.1');
 await new Promise((r) => server.once('listening', r));
-const base = `http://127.0.0.1:${server.address().port}/promo/`;
+const base = `http://127.0.0.1:${server.address().port}/${VIDEO}/`;
 
 const browser = await puppeteer.launch({
   executablePath: process.env.CHROME || '/usr/bin/chromium',
